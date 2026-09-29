@@ -105,7 +105,7 @@ class Job:
         self.started = time.time()
         self.finished: float | None = None
         self.log: deque[tuple[float, str]] = deque(maxlen=1500)
-        self.steps = [{"key": k, "label": STEP_LABELS[k], "state": "pending",
+        self.steps = [{"key": k, "label": STEP_LABELS.get(k, k), "state": "pending",
                        "started": None, "finished": None, "detail": ""} for k in steps]
         self._lock = threading.Lock()
 

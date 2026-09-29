@@ -164,12 +164,9 @@ class Installer:
     def begin(self, action: str) -> Job:
         if not self._lock.acquire(blocking=False):
             raise RuntimeError("An install is already in progress.")
-        steps = ["running"]
-        job = Job(f"install:{action}", None, steps)
+        job = Job(f"install:{action}", None, ["run"])
+        job.steps[0]["label"] = "Installing"
         self.job = job
-        self._steps = ["run"]
-        job.steps = [{"key": "run", "label": "Installing", "state": "pending",
-                      "started": None, "finished": None, "detail": ""}]
         threading.Thread(target=self._run, args=(job, action), daemon=True).start()
         return job
 
