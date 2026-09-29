@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# macOS
+.DS_Store
+
+# Local runtime artifacts (never commit real credentials/state)
+/etc/
+*.tar
+auth.json
+users.json
+secret.key
+tls.crt
+tls.key
+state.json
+*.log
+
+# Screenshots are committed on purpose (docs/screenshots/)

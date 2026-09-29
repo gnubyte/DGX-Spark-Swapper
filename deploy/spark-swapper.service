@@ -1,0 +1,19 @@
+[Unit]
+Description=Spark Swapper — one-click model switcher (https :8999)
+After=network-online.target docker.service
+Wants=network-online.target docker.service
+
+[Service]
+Type=simple
+User=root
+Environment=HOME=/root
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 /opt/spark-swapper/app.py
+Restart=always
+RestartSec=3
+# A swap launches long-running helpers (the Flash start.sh and its memory
+# watchdog). Restarting this web service must not kill them mid-load.
+KillMode=process
+
+[Install]
+WantedBy=multi-user.target
