@@ -95,6 +95,17 @@ and reboot. llama.cpp comes from [unslothai/llama.cpp](https://github.com/unslot
 releases because mainline llama.cpp has no MTP drafting for these models yet; every
 build is checked against the SHA-256 the release publishes.
 
+### Changing the API key
+
+Set `"api_key"` in `/etc/spark-swapper/models.json` (letters, digits, `.`, `_`, `-`), then
+`sudo systemctl restart spark-swapper`, run *Provisioning ▸ HTTPS front* again, and switch
+models once (the SGLang container is recreated with the new key automatically). Connected
+apps need the new key — DSH users paste a new connection code.
+
+Other switches in that file: `"allow_open_front": true` lets key-less models start behind a
+front that doesn't check the key (not recommended); `"llamacpp_sandbox": false` runs
+llama-server as root if its sandbox can't reach the GPU on your system.
+
 ### Adding or changing models
 
 Models live in `swapper/catalog.json`, which ships with every release — so an update
@@ -148,6 +159,19 @@ newer one it **installs it automatically** — unless you opt out.
   serving — only the web page restarts. The result shows on the Settings tab.
 - A Swapper running in Docker can't replace itself: it shows that an update is out;
   pull the new image (`pull-docker.sh`).
+- **Signed releases (recommended):** the checksum only proves the download wasn't
+  damaged — it comes from the same GitHub release as the package. To make boxes install
+  only releases you signed, create a key once and ship its public half:
+  ```bash
+  ssh-keygen -t ed25519 -f ~/.ssh/spark-swapper-release -C "Spark Swapper releases"
+  printf 'spark-swapper-release namespaces="spark-swapper-release" %s\n' \
+    "$(cut -d' ' -f1,2 ~/.ssh/spark-swapper-release.pub)" > swapper/release-signers
+  ```
+  Commit `swapper/release-signers`; from the release after that, boxes refuse any update
+  without a valid `spark-swapper-<version>.tar.gz.sig`. Sign each release with
+  `deploy/sign-release.sh <version> ~/.ssh/spark-swapper-release` (the key never touches
+  GitHub), or store the private key in the repo secret `RELEASE_SIGNING_KEY` to have the
+  release workflow sign — automatic, but it then trusts anyone who can push to `main`.
 
 **Publishing a release** (maintainers): bump `swapper/VERSION` and add a `## <version>`
 section to `CHANGELOG.md`, then merge to `main`. `.github/workflows/release.yml` runs the
@@ -261,7 +285,14 @@ check its fingerprint against the one the Connect tab shows
   matching `Origin`; five wrong passwords from one address locks it out on a
   doubling interval (30 s → 1 h).
 - The model servers listen on `127.0.0.1` only; the HTTPS front on `:11443` written by
-  Spark Swapper refuses requests without the API key (Bearer or `x-api-key`).
+  Spark Swapper refuses requests without the API key (Bearer or `x-api-key`). A fresh
+  install gets its own random key. Models whose servers have no key of their own
+  (TensorFold 27B, Nemotron) won't start while `:11443` is served by a front that doesn't
+  check the current key — run *Provisioning ▸ HTTPS front* first.
+- llama.cpp servers (Strix Halo) run as a throwaway unprivileged user (`DynamicUser`)
+  with a read-only system; the weights and builds live in `/var/lib/spark-swapper-runtime`.
+- Recipe scripts run as the box's user (via `setpriv`), with secrets passed in the
+  environment rather than on the command line.
 - Downloads (weights, llama.cpp, updates) are verified against published SHA-256s
   before use; archives are unpacked with path checks.
 - Strict CSP (no inline scripts), TLS 1.2+ only, `X-Frame-Options: DENY`.

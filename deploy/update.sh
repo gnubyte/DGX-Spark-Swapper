@@ -23,13 +23,22 @@ RESULT="$STATE/update-result.json"
 LOG="$STATE/update.log"
 PORT="${SWAPPER_PORT:-8999}"
 
+UNIT=/etc/systemd/system/spark-swapper.service
+
 mkdir -p "$STATE"
 exec >>"$LOG" 2>&1
 echo
 echo "==> $(date -Is) update.sh from $NEW"
 
-old_ver=$(cat "$APP/VERSION" 2>/dev/null || echo unknown)
-new_ver=$(cat "$NEW/swapper/VERSION" 2>/dev/null || echo unknown)
+# One update at a time, even if a second one was started by mistake.
+exec 9>"$STATE/update.lock"
+if ! flock -n 9; then
+  echo "!! another update is running; leaving it to finish"
+  exit 1
+fi
+
+old_ver=$(tr -d '[:space:]' < "$APP/VERSION" 2>/dev/null || true); old_ver=${old_ver:-unknown}
+new_ver=$(tr -d '[:space:]' < "$NEW/swapper/VERSION" 2>/dev/null || true); new_ver=${new_ver:-unknown}
 
 result() {  # state message
   python3 - "$RESULT" "$1" "$old_ver" "$new_ver" "${2:-}" <<'PY'
@@ -58,6 +67,7 @@ fi
 echo "==> backing up $APP ($old_ver) to $BACKUP"
 rm -rf "$BACKUP"
 cp -a "$APP" "$BACKUP" || { result failed "Couldn't back up $APP."; exit 1; }
+cp -a "$UNIT" "$BACKUP.service" 2>/dev/null || true
 
 echo "==> installing $new_ver"
 if SWAPPER_FROM_UPDATER=1 bash "$NEW/deploy/install.sh"; then
@@ -74,6 +84,8 @@ fi
 echo "==> rolling back to $old_ver"
 rm -rf "$APP"
 cp -a "$BACKUP" "$APP"
+[[ -f "$BACKUP.service" ]] && cp -a "$BACKUP.service" "$UNIT"
+systemctl daemon-reload
 systemctl restart spark-swapper
 if healthy >/dev/null; then
   result rolled_back "The new version didn't start; $old_ver is running again. Details: $LOG"

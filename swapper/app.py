@@ -296,9 +296,10 @@ class Handler(BaseHTTPRequestHandler):
         if n > 64 * 1024:
             return {}
         try:
-            return json.loads(self.rfile.read(n) or b"{}")
+            body = json.loads(self.rfile.read(n) or b"{}")
         except ValueError:
             return {}
+        return body if isinstance(body, dict) else {}
 
     def _same_origin(self) -> bool:
         # Every state change is a JSON POST carrying our custom header, which a
@@ -469,6 +470,10 @@ class Handler(BaseHTTPRequestHandler):
             action = str(body.get("action", "")) if path == "/api/install" else f"model:{body.get('key', '')}"
             if action not in self.installer.ACTIONS:
                 return self._json(400, {"error": "Unknown action."})
+            # Infrastructure installs change the host (packages, nginx, boot settings):
+            # admins only, and not through app tokens. Anyone signed in may install a model.
+            if not action.startswith("model:") and (role != "admin" or user.get("via") == "token"):
+                return self._json(403, {"error": "Only an admin signed in to this page can run provisioning."})
             try:
                 job = self.installer.begin(action)
             except RuntimeError as e:
@@ -494,6 +499,7 @@ class Handler(BaseHTTPRequestHandler):
             if len(new) < 8:
                 return self._json(400, {"error": "Use a password of at least 8 characters."})
             set_password(me, new)
+            TOKENS.revoke_user(me)   # a new password ends every other sign-in, app connections included
             return self._json(200, {"ok": True}, self._set_session(me))
 
         # ── admin-only ──
@@ -526,7 +532,8 @@ class Handler(BaseHTTPRequestHandler):
                 if len(p) < 8:
                     return self._json(400, {"error": "Use a password of at least 8 characters."})
                 add_user(u, p, r)
-            return self._json(201, {"ok": True, "user": u}, self._set_session(u))
+            # (No session cookie here: the admin stays signed in as themselves.)
+            return self._json(201, {"ok": True, "user": u})
 
         if path == "/api/users/reset":
             with _auth_lock:
@@ -537,6 +544,7 @@ class Handler(BaseHTTPRequestHandler):
                 if len(p) < 8:
                     return self._json(400, {"error": "Use a password of at least 8 characters."})
                 set_password(u, p)
+                TOKENS.revoke_user(u)
             return self._json(200, {"ok": True, "user": u})
 
         if path == "/api/users/remove":

@@ -36,6 +36,20 @@ import hardware
 ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 DEMO = os.environ.get("SWAPPER_DEMO", "") == "1"
 ROOT = Path(__file__).resolve().parent
+DEFAULT_STATE = Path("/var/lib/spark-swapper")
+FRONT_CONF = Path("/etc/nginx/conf.d/spark-model-front.conf")
+FRONT_MARK = "# Written by Spark Swapper"
+_SECRETISH = re.compile(r"KEY|TOKEN|SECRET|PASSWORD", re.I)
+
+
+def key_digest(key: str) -> str:
+    """How the HTTPS front's config records which API key it enforces."""
+    return hashlib.sha256(key.encode()).hexdigest()
+
+
+def shown_env(env: dict) -> str:
+    """K=V pairs for a log line, with secret-looking values hidden."""
+    return " ".join(f"{k}={'•••' if _SECRETISH.search(k) else v}" for k, v in env.items())
 
 
 def app_version() -> str:
@@ -217,7 +231,11 @@ class Engine:
         self.state_dir = Path(state_dir)
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.version = app_version()
-        site = config_mod.load_json(self.config_path, {}) or {}
+        site = config_mod.load_site(self.config_path)   # a broken config stops here, loudly
+        # Model weights and llama.cpp builds live outside the 0700 state dir so a
+        # sandboxed (unprivileged) llama-server can read them.
+        self.runtime_dir = Path(os.environ.get("SWAPPER_RUNTIME") or (
+            "/var/lib/spark-swapper-runtime" if self.state_dir == DEFAULT_STATE else self.state_dir / "runtime"))
         if DEMO:
             self.platform = os.environ.get("SWAPPER_DEMO_PLATFORM", hardware.NVIDIA_GB10)
             self.platform_evidence = "demo"
@@ -282,7 +300,23 @@ class Engine:
 
     @property
     def models_dir(self) -> Path:
-        return self.state_dir / "models"
+        return self.runtime_dir / "models"
+
+    @staticmethod
+    def own_key(m: dict) -> bool:
+        """Whether the model's server checks the API key itself. Recipe scripts
+        whose servers can't (TensorFold 27B, Nemotron) rely on the HTTPS front."""
+        if "own_key" in m:
+            return bool(m["own_key"])
+        return m["kind"] != "recipe-script"
+
+    def updating(self) -> bool:
+        """A self-update has been handed to deploy/update.sh and hasn't reported back."""
+        try:
+            r = json.loads((self.state_dir / "update-result.json").read_text())
+        except (OSError, ValueError):
+            return False
+        return r.get("state") == "running" and time.time() - (r.get("started") or 0) < 1800
 
     def hostname(self) -> str:
         return os.uname().nodename if hasattr(os, "uname") else socket.gethostname()
@@ -308,6 +342,30 @@ class Engine:
 
     def container_exists(self, name: str) -> bool:
         return sh(["docker", "inspect", name], timeout=15)[0] == 0
+
+    @staticmethod
+    def args_hash(m: dict) -> str:
+        return hashlib.sha256(json.dumps(m.get("docker_run") or []).encode()).hexdigest()[:16]
+
+    def container_current(self, m: dict) -> bool:
+        """Whether the existing container was created with the docker_run we'd
+        use now. Containers we made carry a hash label; older ones (made by 1.x
+        or by hand) are kept unless they use a different API key or port."""
+        rc, out = sh(["docker", "inspect", "-f", '{{index .Config.Labels "swapper.args"}}|{{json .Args}}',
+                      m["container"]], timeout=15)
+        if rc != 0:
+            return False
+        label, _, args_json = out.partition("|")
+        if label and label != "<no value>":
+            return label == self.args_hash(m)
+        try:
+            args = json.loads(args_json) or []
+        except ValueError:
+            return True
+
+        def val(flag):
+            return args[args.index(flag) + 1] if flag in args and args.index(flag) + 1 < len(args) else None
+        return val("--api-key") in (None, self.key) and val("--port") in (None, str(self.api_port))
 
     def image_exists(self, name: str) -> bool:
         return sh(["docker", "image", "inspect", name], timeout=15)[0] == 0
@@ -419,15 +477,17 @@ class Engine:
 
     # ── status ──
     def front_state(self) -> dict:
-        """Whether the :11443 HTTPS front is ours (it then checks the API key)."""
+        """Is the :11443 HTTPS front up, did Spark Swapper write it, and does it
+        check the API key this box uses now (it records a hash of the key)."""
         if DEMO:
-            return {"up": True, "enforces_key": True}
-        conf = Path("/etc/nginx/conf.d/spark-model-front.conf")
+            return {"up": True, "ours": True, "enforces_key": True}
         try:
-            ours = "Written by Spark Swapper" in conf.read_text(errors="replace")
+            text = FRONT_CONF.read_text(errors="replace")
         except OSError:
-            ours = False
-        return {"up": port_open(self.cfg.get("nginx_port", 11443)), "enforces_key": ours or DEMO}
+            text = ""
+        ours = FRONT_MARK in text
+        enforces = ours and bool(self.key) and f"# api-key-sha256: {key_digest(self.key)}" in text
+        return {"up": port_open(self.cfg.get("nginx_port", 11443)), "ours": ours, "enforces_key": enforces}
 
     def model_summary(self, key: str, m: dict, running: bool, healthy: bool, served: dict | None,
                       measured: dict) -> dict:
@@ -446,7 +506,7 @@ class Engine:
             "installed": inst["installed"],
             "install_detail": inst["detail"],
             "install": {"size_gb": install.get("size_gb"), "time": install.get("time"),
-                        "requires": install.get("requires", [])} if install else None,
+                        "requires": install.get("requires", []), "note": install.get("note")} if install else None,
             "perf": m.get("perf"),
             "measured": measured.get(key),
             "recommended": bool(m.get("recommended")),
@@ -567,13 +627,17 @@ class Engine:
                 "compat": {"supportsTools": True, "supportsUsageInStreaming": True},
             }],
         }
+        defaults = {
+            "model": {"primary": ref},
+            "compaction": {"model": ref, "memoryFlush": {"model": ref}},
+        }
+        if m.get("vision"):
+            defaults["imageModel"] = ref
+        else:
+            job.say("This model can't see images, so OpenClaw's image model is left as it was.")
         patch = {
             "models": {"providers": {m["openclaw_provider"]: provider}},
-            "agents": {"defaults": {
-                "model": {"primary": ref},
-                "imageModel": ref,
-                "compaction": {"model": ref, "memoryFlush": {"model": ref}},
-            }},
+            "agents": {"defaults": defaults},
         }
         oc_bin = self.cfg["openclaw"]["bin"]
         replace = f"models.providers.{m['openclaw_provider']}.models"
@@ -611,19 +675,28 @@ class Engine:
         env.update({k: str(v) for k, v in (extra or {}).items()})
         return env
 
-    def as_user(self, cmd: list[str], env: dict | None = None) -> list[str]:
-        """`cmd` as the box's user with a clean environment (HOME etc. set)."""
-        envs = [f"{k}={v}" for k, v in self.user_env(env).items()]
+    def as_user(self, cmd: list[str], env: dict | None = None) -> tuple[list[str], dict]:
+        """(argv, env) running `cmd` as the box's user with a clean environment.
+        setpriv keeps the process in our process group (runuser starts a new
+        session), so a timeout can stop everything the command started; the
+        environment is passed directly, so values like API keys never show up
+        in `ps`."""
+        envd = self.user_env(env)
         if os.geteuid() == 0 and self.user != "root":
-            return ["runuser", "-u", self.user, "--", "env", "-i", *envs, *cmd]
-        return ["env", "-i", *envs, *cmd]
+            import pwd
+            import shutil
+            pw = pwd.getpwnam(self.user)
+            if shutil.which("setpriv"):
+                return ["setpriv", f"--reuid={pw.pw_uid}", f"--regid={pw.pw_gid}", "--init-groups", "--", *cmd], envd
+            return ["runuser", "-u", self.user, "--", *cmd], envd
+        return list(cmd), envd
 
-    def run_cmd(self, m_or_step: dict, cmd: list[str], env: dict | None = None) -> tuple[list[str], dict | None]:
+    def run_cmd(self, m_or_step: dict, cmd: list[str], env: dict | None = None) -> tuple[list[str], dict]:
         """(argv, env) for a recipe command honouring "as" / "run_as" (user | root)."""
         who = m_or_step.get("as") or m_or_step.get("run_as") or "root"
         if who == "user":
-            return self.as_user(cmd, env), None
-        return cmd, {**os.environ, "HOME": "/root", **{k: str(v) for k, v in (env or {}).items()}}
+            return self.as_user(cmd, env)
+        return list(cmd), {**os.environ, "HOME": "/root", **{k: str(v) for k, v in (env or {}).items()}}
 
     def ensure_docker_group(self, job: Job):
         """Recipes run their containers as the box's user, who must be in the docker group."""
@@ -735,6 +808,16 @@ class Engine:
                 raise SwapFailed(f"{m['title']} isn't installed (no recipe at {m['dir']}). Install it from the Models tab.")
             if m.get("run_as") == "user":
                 self.ensure_docker_group(job)
+        if not self.own_key(m) and self.key and not self.cfg.get("allow_open_front"):
+            front = self.front_state()
+            if front["up"] and not front["enforces_key"]:
+                ng = self.cfg.get("nginx_port", 11443)
+                why = "it was set up for a different key" if front["ours"] else "Spark Swapper didn't set it up"
+                raise SwapFailed(
+                    f"{m['title']}'s server doesn't check the API key, and the HTTPS front on :{ng} doesn't "
+                    f"either ({why}) — anyone on your network could use the model. Run Provisioning ▸ "
+                    f"HTTPS front, then switch again. (To allow it anyway, set \"allow_open_front\": true "
+                    f"in {self.config_path}.)")
         elif kind == "llamacpp":
             if not self.llama_server():
                 raise SwapFailed("llama.cpp isn't installed. Install it from the Provisioning tab.")
@@ -773,14 +856,21 @@ class Engine:
         timeout = m.get("start_timeout_s", 1800)
         kind = m["kind"]
         if kind == "sglang-docker":
-            if self.container_exists(m["container"]):
+            exists = self.container_exists(m["container"])
+            if exists and not self.container_current(m):
+                job.say(f"{m['container']} was created with other settings (API key, port or arguments); "
+                        "recreating it — the weights are cached, so only the start takes time.")
+                sh(["docker", "rm", "-f", m["container"]], timeout=60)
+                exists = False
+            if exists:
                 sh(["docker", "update", "--restart", "unless-stopped", m["container"]], timeout=20)
                 rc, out = sh(["docker", "start", m["container"]], timeout=60)
                 job.say(f"docker start {m['container']}: {out}")
                 if rc != 0:
                     raise SwapFailed(f"docker start failed: {out}")
             else:
-                rc, out = sh(["docker", "run", "-d", "--name", m["container"], *m["docker_run"]], timeout=300)
+                rc, out = sh(["docker", "run", "-d", "--name", m["container"],
+                              "--label", f"swapper.args={self.args_hash(m)}", *m["docker_run"]], timeout=300)
                 job.say(out)
                 if rc != 0:
                     raise SwapFailed(f"docker run failed: {out[-400:]}")
@@ -804,8 +894,7 @@ class Engine:
             env = {"PORT": self.api_port, **(m.get("env") or {})}
             argv, penv = self.run_cmd(m, m.get("start") or ["bash", "./start.sh"], env)
             logfile = self.state_dir / f"start-{key}-{job.id}.log"
-            job.say(f"{' '.join(m.get('start') or ['./start.sh'])} in {m['dir']}  ("
-                    + " ".join(f"{k}={v}" for k, v in env.items()) + ")")
+            job.say(f"{' '.join(m.get('start') or ['./start.sh'])} in {m['dir']}  ({shown_env(env)})")
             with open(logfile, "w") as fh:
                 proc = subprocess.Popen(argv, cwd=m["dir"], env=penv, stdout=fh, stderr=subprocess.STDOUT,
                                         stdin=subprocess.DEVNULL, start_new_session=True)
@@ -816,23 +905,41 @@ class Engine:
             if not self.mtp_supported(exe) and m.get("spec_args"):
                 job.say("This llama.cpp build has no MTP drafts (--spec-type draft-mtp), so the model runs "
                         "without them — about half the speed. Update llama.cpp on the Provisioning tab.")
-            cache = self.state_dir / "llama-cache"
-            cache.mkdir(parents=True, exist_ok=True)
             unit = m["unit"]
             sh(["systemctl", "stop", unit], timeout=30)
             sh(["systemctl", "reset-failed", unit], timeout=10)
             cmd = ["systemd-run", f"--unit={unit}", "--collect", "--quiet",
                    "--description", f"Spark Swapper: {m['title']}",
                    "-p", "Restart=no", "-p", "LimitMEMLOCK=infinity",
-                   f"--setenv=LD_LIBRARY_PATH={exe.parent}",
-                   f"--setenv=HOME={cache}", f"--setenv=XDG_CACHE_HOME={cache}",
-                   "--", *argv]
+                   f"--setenv=LD_LIBRARY_PATH={exe.parent}", *self.llama_sandbox(), "--", *argv]
             shown = ["•••" if a == self.key else a for a in argv[1:]]
             job.say("llama-server " + " ".join(shown))
             rc, out = sh(cmd, timeout=30)
             if rc != 0:
                 raise SwapFailed(f"systemd-run failed: {out[-400:]}")
             self._wait_healthy(key, job, timeout, proc=None, logfile=None, unit=unit)
+
+    def llama_sandbox(self) -> list[str]:
+        """systemd-run options that run llama-server as a throwaway unprivileged
+        user with a read-only system, the GPU's device groups and its own cache
+        directory (Mesa keeps compiled shaders there). "llamacpp_sandbox": false
+        in the site config runs it as root instead."""
+        cache = "/var/cache/spark-swapper-llama"
+        if self.cfg.get("llamacpp_sandbox", True) is False:
+            Path(cache).mkdir(parents=True, exist_ok=True)
+            return [f"--setenv=HOME={cache}", f"--setenv=XDG_CACHE_HOME={cache}"]
+        import grp
+        opts = ["-p", "DynamicUser=yes", "-p", "CacheDirectory=spark-swapper-llama",
+                "-p", "ProtectSystem=strict", "-p", "ProtectHome=yes", "-p", "PrivateTmp=yes",
+                "-p", "NoNewPrivileges=yes",
+                f"--setenv=HOME={cache}", f"--setenv=XDG_CACHE_HOME={cache}"]
+        for group in ("render", "video"):
+            try:
+                grp.getgrnam(group)
+                opts += ["-p", f"SupplementaryGroups={group}"]
+            except KeyError:
+                pass
+        return opts
 
     def _journal(self, unit: str, since: float) -> list[str]:
         rc, out = sh(["journalctl", "-u", unit, "--since", f"@{int(since)}", "-o", "cat", "--no-pager"], timeout=15)
@@ -882,7 +989,12 @@ class Engine:
                 raise SwapFailed(f"{m['title']} launcher exited with code {proc.returncode}. See the log above.")
             if proc is None and seen_running and not running:
                 if unit:
-                    job.say("\n".join(self._journal(unit, t0 - 5)[-25:]))
+                    tail = self._journal(unit, t0 - 5)[-25:]
+                    job.say("\n".join(tail))
+                    if any(w in " ".join(tail).lower() for w in ("permission denied", "vk_error_initialization_failed",
+                                                                 "no vulkan devices")):
+                        job.say("If llama-server couldn't open the GPU from its sandbox, set "
+                                "\"llamacpp_sandbox\": false in /etc/spark-swapper/models.json and switch again.")
                 else:
                     _, logs = sh(["docker", "logs", "--tail", "25", m["container"]], timeout=20)
                     job.say(logs)
@@ -972,6 +1084,12 @@ class Engine:
             job.say(f"Note: this model's server has no API key of its own, and the HTTPS front on :{ng} "
                     "wasn't set up by Spark Swapper, so it doesn't check the key either. Run "
                     f"Provisioning ▸ HTTPS front once to make :{ng} require the API key.")
+        # The first request after a load is slow (shader and graph compilation on
+        # some engines); warm up so the speed shown is the one you'll get.
+        http_json(f"http://127.0.0.1:{self.api_port}/v1/chat/completions", self.key, timeout=120,
+                  body={"model": m["served_id"], "max_tokens": 16, "temperature": 0,
+                        "messages": [{"role": "user", "content": "Say hello."}],
+                        "chat_template_kwargs": {"enable_thinking": False}})
         result = self.measure(key, job) or self.measure(key, job, usage=False)
         if not result or not result.get("tokens"):
             # Some servers don't stream the way the speed check expects; a plain
@@ -1000,6 +1118,8 @@ class Engine:
     def begin_swap(self, target: str) -> Job:
         if target not in self.models:
             raise ValueError("unknown model")
+        if self.updating():
+            raise RuntimeError("Spark Swapper is updating itself — try again in a minute.")
         if not self.install_state(target, fresh=True)["installed"]:
             raise NotInstalled(f"{self.models[target]['title']} isn't installed yet. Install it first.")
         if not self._swap_lock.acquire(blocking=False):
@@ -1053,6 +1173,7 @@ class Engine:
             job.step(cur, "done")
 
             cur = "openclaw"; job.step(cur, "running")
+            oc_note = None
             if not self.openclaw_installed():
                 job.say("OpenClaw isn't installed on this box — skipping. (Install it on the Provisioning tab.)")
                 job.step(cur, "skipped")
@@ -1060,12 +1181,18 @@ class Engine:
                 job.say("OpenClaw already points here.")
                 job.step(cur, "skipped")
             else:
-                self.openclaw_point_to(target, job)
-                job.step(cur, "done")
-
+                try:
+                    self.openclaw_point_to(target, job)
+                    job.step(cur, "done")
+                    oc_note = "Existing OpenClaw chats may still remember the old model — start a new chat if one errors."
+                except SwapFailed as e:
+                    # The model is serving; only OpenClaw is behind. Don't throw the switch away.
+                    job.say(f"⚠ {e}")
+                    job.step(cur, "failed", str(e))
+                    oc_note = f"The model is serving, but OpenClaw wasn't repointed: {e}"
             self.save_state(desired=target, last_swap={"to": target, "from": source, "at": time.time(), "ok": True})
             job.state = "done"
-            job.note = "Existing OpenClaw chats may still remember the old model — start a new chat if one errors."
+            job.note = oc_note
         except Exception as e:  # noqa: BLE001 — every failure must reach the UI
             msg = str(e) if isinstance(e, SwapFailed) else f"{type(e).__name__}: {e}"
             job.say(f"✗ {msg}")

@@ -67,9 +67,12 @@ fi
 # ── render the template (only if the box doesn't already have a config) ──
 if [[ ! -s "$CONF/models.json" ]]; then
   echo "==> rendering config: user=$USER_ host=$IP openclaw=$OC_BIN"
+  # A fresh box gets its own API key instead of the well-known "vllm-local".
+  KEY="sk-spark-$(openssl rand -hex 20)"
   sed -e "s/{{USER}}/$USER_/g" \
       -e "s/{{PUBLIC_HOST}}/$IP/g" \
       -e "s/{{OPENCLAW_BIN}}/$OC_BIN/g" \
+      -e "s/\"api_key\": \"vllm-local\"/\"api_key\": \"$KEY\"/" \
       "$APP/models.json" > "$CONF/models.json"
   chmod 640 "$CONF/models.json"
 else
@@ -108,7 +111,7 @@ if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q "Status: active
   ufw allow "$PORT/tcp" >/dev/null && echo "==> ufw: allowed $PORT/tcp"
 fi
 
-for _ in $(seq 1 20); do
+for _ in $(seq 1 120); do
   curl -ksf "https://127.0.0.1:$PORT/api/session" >/dev/null && break; sleep 0.5
 done
 if curl -ksf "https://127.0.0.1:$PORT/api/session" >/dev/null; then

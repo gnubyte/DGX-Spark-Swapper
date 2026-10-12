@@ -18,6 +18,7 @@
       "stop": ["bash", "./stop.sh"],
       "run_as": "user",
       "env": { "HOST": "127.0.0.1", "WAIT_TIMEOUT": "2400" },
+      "own_key": false,
       "container": "qwen38-27b-tf",
       "served_id": "Qwen3.8-27B",
       "context": 262144,
@@ -61,13 +62,14 @@
       "start": ["bash", "./start.sh"],
       "stop": ["bash", "./stop.sh"],
       "run_as": "user",
-      "env": { "HOST": "127.0.0.1", "WAIT_TIMEOUT": "3000" },
+      "env": { "HOST": "127.0.0.1", "WAIT_TIMEOUT": "3000", "TENSORFOLD_API_KEY": "{{API_KEY}}" },
+      "own_key": true,
       "container": "qwen38-flash-next-tf",
       "served_id": "Qwen3.8-Flash-Next",
       "context": 262144,
       "vision": true,
       "anthropic_api": true,
-      "min_free_gib": 92,
+      "min_free_gib": 94,
       "start_timeout_s": 3000,
       "eta": "a few minutes (loads ~66 GiB of weights)",
       "openclaw_provider": "tfflash",
@@ -82,6 +84,7 @@
         "requires": ["git", "docker"],
         "size_gb": 165,
         "time": "1–2 hours: builds the engine image and downloads the ~122 GiB checkpoint",
+        "note": "The build needs at least 10 GiB of free memory. If a large model is serving and memory is tight, it stops and says so — switch to a smaller model first, then install.",
         "steps": [
           { "do": "git", "url": "https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold.git", "dir": "{{HOME}}/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold" },
           { "do": "run", "cmd": ["bash", "scripts/prepare.sh"], "cwd": "{{HOME}}/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold", "as": "user", "timeout": 21600 }
@@ -106,6 +109,7 @@
       "stop": ["bash", "./stop.sh"],
       "run_as": "user",
       "env": { "HOST": "127.0.0.1" },
+      "own_key": false,
       "container": "nemotron-3.5-lightning-dspark",
       "served_id": "nemotron-3.5-lightning",
       "served_match": "Nemotron-3.5-Lightning",
@@ -203,7 +207,7 @@
         "--tool-call-parser", "qwen3_coder",
         "--sampling-defaults", "model",
         "--enable-metrics", "--enable-cache-report",
-        "--host", "127.0.0.1", "--port", "8888", "--api-key", "vllm-local"
+        "--host", "127.0.0.1", "--port", "{{API_PORT}}", "--api-key", "{{API_KEY}}"
       ]
     },
 

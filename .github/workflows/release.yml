@@ -5,6 +5,13 @@ name: release
 # Installed Swappers look for this every Sunday and install it unless an admin
 # turned automatic updates off. Bump swapper/VERSION and add a CHANGELOG.md
 # section for the version to ship one.
+#
+# Signing: boxes whose installed copy ships swapper/release-signers only install
+# releases carrying a matching spark-swapper-<version>.tar.gz.sig. Sign with a
+# key that never touches GitHub (deploy/sign-release.sh, run by a maintainer) —
+# or, weaker but automatic, put the private key in the RELEASE_SIGNING_KEY secret
+# and this workflow signs (that protects against tampered downloads, not against
+# someone who can push to main).
 
 on:
   push:
@@ -22,6 +29,8 @@ concurrency:
 
 jobs:
   release:
+    # Only ever from main, also when started by hand.
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -62,11 +71,26 @@ jobs:
           awk -v v="$ver" '$0 ~ "^## " v "( |$)" {on=1; next} on && /^## / {exit} on {print}' CHANGELOG.md > notes.md || true
           [[ -s notes.md ]] || echo "Spark Swapper $ver." > notes.md
 
+      - name: Sign (when RELEASE_SIGNING_KEY is set)
+        if: steps.v.outputs.exists == 'false'
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+        run: |
+          ver=${{ steps.v.outputs.version }}
+          if [[ -n "$RELEASE_SIGNING_KEY" ]]; then
+            umask 077
+            printf '%s\n' "$RELEASE_SIGNING_KEY" > "$RUNNER_TEMP/release-key"
+            ssh-keygen -Y sign -f "$RUNNER_TEMP/release-key" -n spark-swapper-release "spark-swapper-$ver.tar.gz"
+            rm -f "$RUNNER_TEMP/release-key"
+          fi
+
       - name: Publish
         if: steps.v.outputs.exists == 'false'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           ver=${{ steps.v.outputs.version }}
-          gh release create "v$ver" "spark-swapper-$ver.tar.gz" SHA256SUMS \
+          files=("spark-swapper-$ver.tar.gz" SHA256SUMS)
+          [[ -f "spark-swapper-$ver.tar.gz.sig" ]] && files+=("spark-swapper-$ver.tar.gz.sig")
+          gh release create "v$ver" "${files[@]}" \
             --title "Spark Swapper $ver" --notes-file notes.md --target "$GITHUB_SHA"

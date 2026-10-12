@@ -99,6 +99,11 @@ def download(url: str, dest: Path, *, size: int | None = None, sha256: str | Non
     attempt = 0
     while True:
         have = part.stat().st_size if part.exists() else 0
+        if size is not None and have > size:
+            # Left over from an older, bigger upload of the file: start over.
+            say(f"{label}: the partial download is bigger than the file now is; starting over.")
+            part.unlink()
+            have = 0
         if size is not None:
             free = shutil.disk_usage(dest.parent).free
             need = size - have
@@ -137,8 +142,11 @@ def download(url: str, dest: Path, *, size: int | None = None, sha256: str | Non
                                 say(f"  {label}: {human(have)} at {human(rate)}/s")
             break
         except urllib.error.HTTPError as e:
-            if e.code == 416 and size is not None and have >= size:
+            if e.code == 416 and size is not None and have == size:
                 break  # already complete
+            if e.code == 416:
+                # The range no longer fits the file (it changed upstream): start over.
+                part.unlink(missing_ok=True)
             if e.code in (401, 403, 404):
                 raise FetchError(f"{label}: the server answered {e.code} {e.reason}.") from e
             err = f"{e.code} {e.reason}"

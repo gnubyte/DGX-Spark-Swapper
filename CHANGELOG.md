@@ -25,4 +25,10 @@
   configures nginx on :11443 itself, refusing requests without the key — needed for
   model servers that have no key of their own.
 - The model catalog ships with the app (`catalog.json`), so updates bring new models
-  to existing boxes; local overrides in `/etc/spark-swapper/models.json` still win.
+  to existing boxes; local overrides in `/etc/spark-swapper/models.json` still win, and
+  boxes set up with 1.x pick up the new model titles instead of showing duplicates.
+- Security: fresh installs get their own API key; models without a key of their own
+  won't start behind a front that doesn't check it; llama-server runs unprivileged;
+  release signatures (`swapper/release-signers`, `deploy/sign-release.sh`) can be
+  required for updates; app connections end when their user's password changes;
+  provisioning is admin-only; adding a user no longer signs the admin in as them.

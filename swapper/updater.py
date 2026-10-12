@@ -9,6 +9,10 @@ available. "Check now" and "Update now" do the same on demand.
 How an update runs:
   1. Download the release's spark-swapper-<version>.tar.gz and its SHA256SUMS,
      and check the checksum. Unpack it under /var/lib/spark-swapper/updates/.
+     If this installed copy ships a release-signers file, the package must also
+     carry an SSH signature (spark-swapper-<version>.tar.gz.sig) from one of the
+     keys listed there, checked with `ssh-keygen -Y verify` — see
+     deploy/sign-release.sh. Without that file the checksum is the only check.
   2. Compile-check the new Python files before anything is replaced.
   3. Hand over to deploy/update.sh *from the new release*, started with
      systemd-run so it lives outside this service (it restarts the service).
@@ -39,6 +43,19 @@ from engine import DEMO, ROOT, sh
 
 DEFAULT_REPO = "gnubyte/DGX-Spark-Swapper"
 SETTINGS = {"check": True, "auto_install": True, "hour": 3}
+SIGNERS = ROOT / "release-signers"
+SIG_NAMESPACE = "spark-swapper-release"
+STALE_AFTER = 1800   # a "running" update that hasn't reported back after 30 min failed
+
+
+def verify_signature(archive: Path, signature: Path, signers: Path = SIGNERS) -> tuple[bool, str]:
+    """ssh-keygen -Y verify against the allowed-signers file shipped with this copy."""
+    if not shutil.which("ssh-keygen"):
+        return False, "ssh-keygen isn't installed, so the release's signature can't be checked."
+    with open(archive, "rb") as fh:
+        p = subprocess.run(["ssh-keygen", "-Y", "verify", "-f", str(signers), "-I", SIG_NAMESPACE,
+                            "-n", SIG_NAMESPACE, "-s", str(signature)], stdin=fh, capture_output=True, text=True)
+    return p.returncode == 0, (p.stdout + p.stderr).strip()
 
 
 def parse_version(v: str | None) -> tuple[int, int, int]:
@@ -131,9 +148,12 @@ class Updater:
 
     def read_result(self) -> dict | None:
         try:
-            return json.loads(self.result_file.read_text())
+            r = json.loads(self.result_file.read_text())
         except (OSError, ValueError):
             return None
+        if r.get("state") == "running" and time.time() - (r.get("started") or 0) > STALE_AFTER:
+            r = {**r, "state": "failed", "message": f"The installer didn't report back. See {self.log_file}."}
+        return r
 
     def info(self) -> dict:
         st = self._state()
@@ -163,6 +183,7 @@ class Updater:
             "log": [{"t": t, "m": m} for t, m in list(self.log)[-200:]],
             "last_result": self.read_result(),
             "last_log": log_tail,
+            "signed_only": SIGNERS.exists(),
         }
 
     # ── the weekly schedule ──
@@ -228,6 +249,7 @@ class Updater:
         assets = {a["name"]: a for a in rel.get("assets") or []}
         tarball = assets.get(f"spark-swapper-{ver}.tar.gz")
         sums = assets.get("SHA256SUMS")
+        sig = assets.get(f"spark-swapper-{ver}.tar.gz.sig")
 
         def put(c):
             c = dict(c or {})
@@ -235,7 +257,8 @@ class Updater:
                       "notes": (rel.get("body") or "")[:6000], "published": rel.get("published_at"),
                       "last_check": now, "last_error": None, "retry_after": None,
                       "asset": {"url": tarball["browser_download_url"], "size": tarball.get("size"),
-                                "sums": sums["browser_download_url"] if sums else None} if tarball else None})
+                                "sums": sums["browser_download_url"] if sums else None,
+                                "sig": sig["browser_download_url"] if sig else None} if tarball else None})
             if auto:
                 c["last_auto_check"] = now
             return c
@@ -249,7 +272,7 @@ class Updater:
     # ── installing ──
     def install(self):
         with self._lock:
-            if self.busy:
+            if self.busy or self.engine.updating():
                 raise RuntimeError("An update is already running.")
             ok, why = self.can_install()
             if not ok:
@@ -288,9 +311,24 @@ class Updater:
             downloads = self.engine.state_dir / "downloads"
             archive = fetch.download(asset["url"], downloads / name, size=asset.get("size"), sha256=sha,
                                      say=self.say, label=name)
-            staging = self.engine.state_dir / "updates" / ver
-            if staging.exists():
-                shutil.rmtree(staging)
+            if SIGNERS.exists() and not asset.get("sig"):
+                # The signature may have been uploaded after the last check.
+                self.check()
+                asset = self._state().get("asset") or asset
+            if SIGNERS.exists():
+                if not asset.get("sig"):
+                    raise fetch.FetchError(f"This box only installs signed releases, and {ver} isn't signed.")
+                sig = fetch.download(asset["sig"], downloads / f"{name}.sig", say=self.say, label=f"{name}.sig")
+                ok, detail = verify_signature(archive, sig)
+                sig.unlink(missing_ok=True)
+                if not ok:
+                    raise fetch.FetchError(f"The release's signature didn't check out: {detail[-300:]}")
+                self.say("Signature OK.")
+            # A fresh directory per attempt: an earlier installer may still be reading the last one.
+            updates = self.engine.state_dir / "updates"
+            staging = updates / f"{ver}-{int(time.time())}"
+            for old in sorted(updates.glob("*"), key=lambda q: q.stat().st_mtime)[:-2] if updates.exists() else []:
+                shutil.rmtree(old, ignore_errors=True)
             fetch.safe_extract(archive, staging)
             roots = [p for p in staging.iterdir() if p.is_dir()]
             new_root = roots[0] if len(roots) == 1 else staging
@@ -307,8 +345,10 @@ class Updater:
                                                     "started": time.time()}))
             self.say("Handing over to the installer. The page restarts in a moment; models keep serving.")
             unit = f"spark-swapper-update-{int(time.time())}"
+            env_args = [f"--setenv=SWAPPER_STATE={self.engine.state_dir}",
+                        f"--setenv=SWAPPER_PORT={os.environ.get('SWAPPER_PORT', '8999')}"]
             rc2, out = sh(["systemd-run", f"--unit={unit}", "--collect", "--quiet",
-                           "--description", f"Spark Swapper update to {ver}",
+                           "--description", f"Spark Swapper update to {ver}", *env_args,
                            "/bin/bash", str(new_root / "deploy" / "update.sh"), str(new_root)], timeout=30)
             if rc2 != 0:
                 raise fetch.FetchError(f"Couldn't start the installer: {out[-300:]}")

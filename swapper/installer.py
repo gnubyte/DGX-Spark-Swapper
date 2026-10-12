@@ -26,11 +26,9 @@ from pathlib import Path
 
 import fetch
 import hardware
-from engine import DEMO, Job, SwapFailed, meminfo, port_open, sh
+from engine import DEMO, FRONT_CONF, FRONT_MARK, Job, SwapFailed, key_digest, meminfo, port_open, sh
 
 LLAMACPP_REPO = "unslothai/llama.cpp"
-FRONT_CONF = Path("/etc/nginx/conf.d/spark-model-front.conf")
-FRONT_MARK = "# Written by Spark Swapper"
 _PROGRESS = re.compile(r"\d+(\.\d+)?%|\d+(\.\d+)?\s*[KMGT]i?B/s|\bETA\b", re.I)
 
 INFRA = {
@@ -82,12 +80,16 @@ def nginx_front_conf(cfg: dict, cert: str, key_file: str) -> str:
     lines = [
         f"{FRONT_MARK} — re-run Provisioning ▸ HTTPS front to regenerate; edits are overwritten.",
         "# HTTPS front for the model API (/v1/, API key required) and the OpenClaw gateway (/).",
+        f"# api-key-sha256: {key_digest(api_key) if api_key else 'none'}",
         "map $http_upgrade $swapper_connection_upgrade { default upgrade; '' close; }",
     ]
     if api_key:
+        # Regex keys: the token compares case-sensitively (only the word "Bearer"
+        # is case-insensitive), and a key like "default" can't collide with
+        # map's own keywords.
         lines += [
-            f"map $http_authorization $swapper_bearer_ok {{ default 0; \"~*^Bearer\\s+{esc}$\" 1; }}",
-            f"map $http_x_api_key $swapper_xkey_ok {{ default 0; \"{api_key}\" 1; }}",
+            f"map $http_authorization $swapper_bearer_ok {{ default 0; \"~^(?i:bearer)[ \\t]+{esc}$\" 1; }}",
+            f"map $http_x_api_key $swapper_xkey_ok {{ default 0; \"~^{esc}$\" 1; }}",
         ]
     lines += [
         "server {",
@@ -143,6 +145,19 @@ def grub_with_gpu_limit(text: str, pages: int) -> str:
     if pattern.search(text):
         return pattern.sub(fix, text, count=1)
     return text.rstrip("\n") + f'\nGRUB_CMDLINE_LINUX_DEFAULT="ttm.pages_limit={pages} ttm.page_pool_size={pages}"\n'
+
+
+def world_readable(root: Path):
+    """Directories 0755 and files at least 0644 under `root`: the sandboxed
+    llama-server (a throwaway user) has to read the weights and the build."""
+    if not root.exists():
+        return
+    for dirpath, dirnames, filenames in os.walk(root):
+        os.chmod(dirpath, 0o755)
+        for name in filenames:
+            f = os.path.join(dirpath, name)
+            if not os.path.islink(f):
+                os.chmod(f, os.stat(f).st_mode | 0o444)
 
 
 class Installer:
@@ -279,15 +294,15 @@ class Installer:
     def _state_ssl(self) -> dict:
         ng = self.cfg.get("nginx_port", 11443)
         swapper_cert = Path(os.environ.get("SWAPPER_CONF", "/etc/spark-swapper")) / "tls.crt"
-        nginx_up = port_open(ng)
-        ours = False
-        try:
-            ours = FRONT_MARK in FRONT_CONF.read_text(errors="replace")
-        except OSError:
-            pass
+        front = self.engine.front_state()
+        nginx_up, ours, enforces = front["up"], front["ours"], front["enforces_key"]
         configured = ours or self._other_front(ng)
-        if ours and nginx_up:
+        if ours and nginx_up and enforces:
             detail = f"nginx on :{ng}, API key required"
+        elif ours and nginx_up and not self.engine.key:
+            detail = f"nginx on :{ng}; no API key is set in the config, so none is required"
+        elif ours and nginx_up:
+            detail = f"nginx on :{ng}, but set up for an older API key — run this again"
         elif nginx_up:
             detail = f"something already serves :{ng} (not set up by Spark Swapper — it may not check the API key)"
         elif configured:
@@ -295,8 +310,8 @@ class Installer:
         else:
             detail = "not set up"
         return {"swapper_cert": swapper_cert.exists(), "nginx_up": nginx_up,
-                "nginx_configured": configured, "ours": ours, "port": ng,
-                "present": bool(ours and nginx_up), "detail": detail}
+                "nginx_configured": configured, "ours": ours, "port": ng, "enforces_key": enforces,
+                "present": bool(ours and nginx_up and (enforces or not self.engine.key)), "detail": detail}
 
     @staticmethod
     def _other_front(port: int) -> bool:
@@ -367,6 +382,8 @@ class Installer:
     def begin(self, action: str) -> Job:
         if action not in self.ACTIONS:
             raise ValueError("unknown action")
+        if self.engine.updating():
+            raise RuntimeError("Spark Swapper is updating itself — try again in a minute.")
         if not self._lock.acquire(blocking=False):
             raise RuntimeError("An install is already in progress.")
         try:
@@ -618,8 +635,10 @@ class Installer:
             fresh = True
         FRONT_CONF.parent.mkdir(parents=True, exist_ok=True)
         job.say(f"Writing {FRONT_CONF} (requires the API key on /v1/)…")
-        tmp = FRONT_CONF.with_suffix(".tmp")
-        tmp.write_text(nginx_front_conf(self.cfg, str(cert), str(key)))
+        previous = FRONT_CONF.read_bytes() if FRONT_CONF.exists() else None
+        text = nginx_front_conf(self.cfg, str(cert), str(key))   # validates the key first
+        tmp = FRONT_CONF.with_name(FRONT_CONF.name + ".new")      # not *.conf: nginx ignores it
+        tmp.write_text(text)
         tmp.chmod(0o600)
         tmp.replace(FRONT_CONF)
         default_site = Path("/etc/nginx/sites-enabled/default")
@@ -628,7 +647,12 @@ class Installer:
         rc, out = sh(["nginx", "-t"], timeout=30)
         job.say(out)
         if rc != 0:
-            raise InstallFailed("nginx rejected the configuration (see above).")
+            # Never leave a config that stops nginx from (re)starting.
+            if previous is None:
+                FRONT_CONF.unlink(missing_ok=True)
+            else:
+                FRONT_CONF.write_bytes(previous)
+            raise InstallFailed("nginx rejected the new configuration (see above); the previous one was put back.")
         sh(["systemctl", "enable", "nginx"], timeout=30)
         rc, out = sh(["systemctl", "restart", "nginx"], timeout=60)
         if rc != 0:
@@ -687,11 +711,12 @@ class Installer:
         archive = downloads / name
         fetch.download(assets[name]["browser_download_url"], archive, size=assets[name].get("size"),
                        sha256=sha, say=job.say, label=name)
-        dest = self.engine.state_dir / "llama.cpp" / tag
+        dest = self.engine.runtime_dir / "llama.cpp" / tag
         if dest.exists():
             shutil.rmtree(dest)
         job.say(f"Unpacking into {dest}…")
         fetch.safe_extract(archive, dest)
+        world_readable(self.engine.runtime_dir)
         exe = next((p for p in dest.rglob("llama-server") if p.is_file()), None)
         if not exe:
             raise InstallFailed("The archive has no llama-server.")
@@ -858,6 +883,7 @@ class Installer:
             part = self.engine.local_file(f["repo"], f["path"]).with_name(Path(f["path"]).name + ".part")
             need += (meta.get("size") or 0) - (part.stat().st_size if part.exists() else 0)
         self.engine.models_dir.mkdir(parents=True, exist_ok=True)
+        world_readable(self.engine.runtime_dir)
         free = shutil.disk_usage(self.engine.models_dir).free
         job.say(f"To download: {fetch.human(need)}; free on {self.engine.models_dir}: {fetch.human(free)}.")
         if need > free - 5 * 1024**3:
@@ -872,3 +898,4 @@ class Installer:
                                           "repo": f["repo"], "path": f["path"], "at": time.time()}))
             for p in (dest, marker):
                 p.chmod(0o644)
+            world_readable(self.engine.runtime_dir)

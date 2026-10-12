@@ -32,7 +32,30 @@ def site_values(site: dict) -> dict:
     oc = site.get("openclaw") or {}
     user = oc.get("user") or "root"
     home = oc.get("home") or ("/root" if user == "root" else f"/home/{user}")
-    return {"USER": user, "HOME": home}
+    return {"USER": user, "HOME": home, "API_KEY": str(site.get("api_key", "vllm-local")),
+            "API_PORT": str(site.get("api_port", 8888))}
+
+
+LEGACY_V1 = Path(__file__).resolve().parent / "legacy_v1.json"
+
+
+def strip_legacy(site_models: dict, values: dict, legacy: dict | None) -> dict:
+    """Drop the fields of site entries that still hold the values the 1.x
+    template shipped. A box installed with 1.x has complete "standard" and
+    "flash" entries in its site config; left alone they would shadow the
+    catalog's (titles, order, speeds) and show up as duplicates of the new
+    TensorFold models. Anything the admin actually changed is kept."""
+    old = render((legacy or {}).get("models") or {}, {**values, "USER": values["USER"]})
+    out = {}
+    for key, entry in site_models.items():
+        shipped = old.get(key)
+        if not shipped or not isinstance(entry, dict):
+            out[key] = entry
+            continue
+        kept = {f: v for f, v in entry.items() if f not in shipped or shipped[f] != v}
+        if kept:
+            out[key] = kept
+    return out
 
 
 def load_json(path: Path, default=None):
@@ -49,7 +72,7 @@ def merge(site: dict, catalog: dict, platform: str) -> dict:
     values = site_values(site)
     cat_models = render((catalog or {}).get("models") or {}, values)
     cat_recipes = render((catalog or {}).get("recipes") or {}, values)
-    site_models = site.get("models") or {}
+    site_models = strip_legacy(site.get("models") or {}, values, load_json(LEGACY_V1, {}))
     hidden = set(site.get("hidden_models") or [])
 
     models: dict[str, dict] = {}
@@ -77,9 +100,29 @@ def merge(site: dict, catalog: dict, platform: str) -> dict:
     return out
 
 
-def load(site_path: Path, catalog_path: Path, platform: str) -> dict:
-    site = load_json(site_path)
+class ConfigError(Exception):
+    pass
+
+
+def load_site(site_path: Path) -> dict:
+    """The site config, or a ConfigError that says what's wrong — never silent
+    defaults (they would mean the wrong API key and user)."""
+    try:
+        text = Path(site_path).read_text()
+    except OSError as e:
+        raise ConfigError(f"Can't read {site_path}: {e}") from e
+    try:
+        site = json.loads(text)
+    except ValueError as e:
+        raise ConfigError(f"{site_path} isn't valid JSON ({e}). Fix it and restart: "
+                          "sudo systemctl restart spark-swapper") from e
     if not isinstance(site, dict):
-        raise ValueError(f"{site_path} is not a JSON object")
+        raise ConfigError(f"{site_path} must be a JSON object.")
+    if not isinstance(site.get("openclaw"), dict):
+        raise ConfigError(f"{site_path} has no \"openclaw\" section (user, home, bin, unit).")
+    return site
+
+
+def load(site_path: Path, catalog_path: Path, platform: str) -> dict:
     catalog = load_json(catalog_path, {}) or {}
-    return merge(site, catalog, platform)
+    return merge(load_site(site_path), catalog, platform)

@@ -95,6 +95,40 @@ class ConfigTests(unittest.TestCase):
         self.assertIn("perf", merged)          # new field arrives from the catalog
         self.assertEqual(merged["source"], "catalog+site")
 
+    def test_upgraded_1x_box_gets_catalog_titles_without_duplicates(self):
+        legacy = json.loads((ROOT / "swapper" / "legacy_v1.json").read_text())["models"]
+        rendered = config.render(legacy, {"USER": "pat"})
+        merged = config.merge(site(models=rendered), CATALOG, hardware.NVIDIA_GB10)["models"]
+        titles = [m["title"] for m in merged.values()]
+        self.assertEqual(len(titles), len(set(titles)), titles)
+        self.assertEqual(merged["standard"]["title"], "Qwen3.8 27B (SGLang)")
+        self.assertEqual(merged["flash"]["title"], "Qwen3.8 Flash Next (vLLM)")
+        self.assertEqual(merged["standard"]["source"], "catalog")
+
+    def test_upgraded_box_keeps_its_own_edits(self):
+        legacy = config.render(json.loads((ROOT / "swapper" / "legacy_v1.json").read_text())["models"], {"USER": "pat"})
+        legacy["standard"]["min_free_gib"] = 80
+        merged = config.merge(site(models=legacy), CATALOG, hardware.NVIDIA_GB10)["models"]["standard"]
+        self.assertEqual(merged["min_free_gib"], 80)
+        self.assertEqual(merged["title"], "Qwen3.8 27B (SGLang)")
+
+    def test_api_key_and_port_reach_the_model_args(self):
+        merged = config.merge(site(api_key="sk-spark-abc", api_port=9999), CATALOG, hardware.NVIDIA_GB10)["models"]
+        args = merged["standard"]["docker_run"]
+        self.assertEqual(args[args.index("--api-key") + 1], "sk-spark-abc")
+        self.assertEqual(args[args.index("--port") + 1], "9999")
+        self.assertEqual(merged["tfflash"]["env"]["TENSORFOLD_API_KEY"], "sk-spark-abc")
+
+    def test_broken_site_config_fails_loudly(self):
+        with tempfile.TemporaryDirectory() as d:
+            bad = Path(d) / "models.json"
+            bad.write_text('{"api_key": "x",}')
+            with self.assertRaises(config.ConfigError):
+                config.load_site(bad)
+            bad.write_text('{"api_key": "x"}')
+            with self.assertRaises(config.ConfigError):
+                config.load_site(bad)
+
     def test_hidden_and_site_only_models(self):
         extra = {"title": "Mine", "kind": "sglang-docker", "container": "mine", "served_id": "mine", "context": 1000}
         merged = config.merge(site(hidden_models=["nemotron"], models={"mine": extra}), CATALOG, hardware.NVIDIA_GB10)
@@ -205,13 +239,19 @@ class InstallerTextTests(unittest.TestCase):
     def test_nginx_front_requires_the_key(self):
         conf = nginx_front_conf(site(), "/etc/spark-swapper/tls.crt", "/etc/spark-swapper/tls.key")
         self.assertTrue(conf.startswith("# Written by Spark Swapper"))
-        self.assertIn('"~*^Bearer\\s+vllm\\-local$" 1;', conf)
-        self.assertIn('"vllm-local" 1;', conf)
+        self.assertIn('"~^(?i:bearer)[ \\t]+vllm\\-local$" 1;', conf)
+        self.assertIn('"~^vllm\\-local$" 1;', conf)
+        self.assertIn(f"# api-key-sha256: {hashlib.sha256(b'vllm-local').hexdigest()}", conf)
         self.assertIn('if ($swapper_auth = "00")', conf)
         self.assertIn("return 401", conf)
         self.assertIn("proxy_pass http://127.0.0.1:8888;", conf)
         self.assertIn("proxy_pass http://127.0.0.1:18789;", conf)
         self.assertIn("listen 11443 ssl;", conf)
+
+    def test_nginx_map_keywords_cannot_collide(self):
+        conf = nginx_front_conf(site(api_key="default"), "c", "k")
+        self.assertIn('"~^default$" 1;', conf)
+        self.assertNotIn('"default" 1;', conf)
 
     def test_nginx_front_without_key_and_bad_key(self):
         conf = nginx_front_conf(site(api_key=""), "c", "k")
@@ -319,6 +359,73 @@ class EngineTests(TempDir):
                              check=True, capture_output=True, text=True).stdout
         self.assertEqual(cert_fingerprint(crt), out.strip().split("=", 1)[1])
 
+    def test_keyless_model_refused_behind_an_open_front(self):
+        import engine as engine_mod
+        eng = self.make(platform="nvidia-gb10", openclaw={"user": "pat", "home": str(self.tmp / "home")})
+        d = self.tmp / "home" / "Qwen3.8-27B-DGX-Spark-TensorFold"
+        d.mkdir(parents=True)
+        (d / "start.sh").write_text("#!/bin/sh\n")
+        conf = self.tmp / "front.conf"
+        old_conf, old_port = engine_mod.FRONT_CONF, engine_mod.port_open
+        engine_mod.FRONT_CONF = conf
+        engine_mod.port_open = lambda *a, **k: True
+        eng.ensure_docker_group = lambda job: None
+        try:
+            job = engine_mod.Job("tf27b", None, ["prepare"])
+            conf.write_text("server { listen 11443 ssl; }")            # someone else's front
+            with self.assertRaises(engine_mod.SwapFailed):
+                eng.preflight("tf27b", job)
+            conf.write_text(nginx_front_conf(site(), "c", "k"))          # ours, same key
+            eng.preflight("tf27b", job)
+            conf.write_text(nginx_front_conf(site(api_key="old"), "c", "k"))   # ours, stale key
+            with self.assertRaises(engine_mod.SwapFailed):
+                eng.preflight("tf27b", job)
+            self.assertTrue(Engine.own_key(eng.models["tfflash"]))
+            self.assertFalse(Engine.own_key(eng.models["nemotron"]))
+            self.assertTrue(Engine.own_key(eng.models["standard"]))
+        finally:
+            engine_mod.FRONT_CONF, engine_mod.port_open = old_conf, old_port
+
+    def test_container_reused_only_with_current_settings(self):
+        import engine as engine_mod
+        eng = self.make(platform="nvidia-gb10")
+        m = eng.models["standard"]
+        replies = {}
+        old = engine_mod.sh
+        engine_mod.sh = lambda cmd, **k: replies["inspect"]
+        try:
+            replies["inspect"] = (0, f"{Engine.args_hash(m)}|[]")
+            self.assertTrue(eng.container_current(m))
+            replies["inspect"] = (0, "0123456789abcdef|[]")
+            self.assertFalse(eng.container_current(m))
+            replies["inspect"] = (0, '<no value>|["--port", "8888", "--api-key", "vllm-local"]')
+            self.assertTrue(eng.container_current(m), "a 1.x container with today's key is kept")
+            replies["inspect"] = (0, '<no value>|["--port", "8888", "--api-key", "something-else"]')
+            self.assertFalse(eng.container_current(m))
+            replies["inspect"] = (1, "")
+            self.assertFalse(eng.container_current(m))
+        finally:
+            engine_mod.sh = old
+
+    def test_user_commands_get_a_clean_environment(self):
+        eng = self.make()
+        argv, env = eng.run_cmd({"as": "user"}, ["bash", "x.sh"], {"PORT": 8888, "TENSORFOLD_API_KEY": "k"})
+        self.assertEqual(argv[-2:], ["bash", "x.sh"])
+        self.assertEqual(env["HOME"], "/home/pat")
+        self.assertEqual(env["TENSORFOLD_API_KEY"], "k")
+        self.assertNotIn("k", " ".join(argv), "secrets go in the environment, not the command line")
+        if os.geteuid() == 0:
+            self.assertEqual(argv[0], "setpriv")
+
+    def test_updating_blocks_swaps(self):
+        eng = self.make()
+        (self.tmp / "state" / "update-result.json").write_text(json.dumps({"state": "running", "started": time.time()}))
+        self.assertTrue(eng.updating())
+        with self.assertRaisesRegex(RuntimeError, "updating"):
+            eng.begin_swap("halo27b")
+        (self.tmp / "state" / "update-result.json").write_text(json.dumps({"state": "running", "started": time.time() - 4000}))
+        self.assertFalse(eng.updating(), "a stale handoff doesn't block forever")
+
     def test_public_host(self):
         eng = self.make()
         self.assertEqual(eng.public_host("192.168.1.9:8999"), "192.168.1.9")
@@ -372,6 +479,14 @@ class FetchTests(TempDir):
         self.assertEqual(dest.read_bytes(), payload)
         self.assertFalse(dest.with_name("model.gguf.part").exists())
         self.assertTrue(any("resuming" in s for s in said))
+
+    def test_oversized_partial_file_starts_over(self):
+        payload = os.urandom(200000)
+        url = self.serve(payload)
+        dest = self.tmp / "m.gguf"
+        dest.with_name("m.gguf.part").write_bytes(os.urandom(300000))
+        fetch.download(url, dest, size=len(payload), sha256=hashlib.sha256(payload).hexdigest(), say=lambda s: None)
+        self.assertEqual(dest.read_bytes(), payload)
 
     def test_bad_checksum_is_refused(self):
         url = self.serve(b"hello world")
@@ -495,6 +610,36 @@ class ApiTests(unittest.TestCase):
         self.assertFalse(info["auto_install"])
         code, info, _ = self.call("/api/updates/check", {}, cookie=cookie)
         self.assertTrue(info["available"])
+
+    def test_adding_a_user_keeps_the_admin_signed_in(self):
+        cookie = self.login()
+        code, body, headers = self.call("/api/users/add", {"username": f"u{time.time_ns()}", "password": "password1"},
+                                        cookie=cookie)
+        self.assertEqual(code, 201)
+        self.assertIsNone(headers.get("Set-Cookie"))
+
+    def test_non_object_bodies_are_ignored(self):
+        cookie = self.login()
+        req = urllib.request.Request(self.base + "/api/swap", data=b"[]",
+                                     headers={"X-Swapper": "1", "Content-Type": "application/json", "Cookie": cookie})
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            urllib.request.urlopen(req, timeout=5)
+        with ctx.exception:
+            self.assertEqual(ctx.exception.code, 400)
+
+    def test_tokens_cannot_provision_and_resets_revoke_them(self):
+        cookie = self.login()
+        name = f"t{time.time_ns()}"
+        self.assertEqual(self.call("/api/users/add", {"username": name, "password": "password1"}, cookie=cookie)[0], 201)
+        code, body, headers = self.call("/api/login", {"username": name, "password": "password1"})
+        user_cookie = headers["Set-Cookie"].split(";", 1)[0]
+        code, made, _ = self.call("/api/tokens/create", {"label": "x"}, cookie=user_cookie)
+        bearer = {"Authorization": f"Bearer {made['token']}"}
+        self.assertEqual(self.call("/api/install", {"action": "ssl"}, headers=bearer)[0], 403)
+        self.assertEqual(self.call("/api/install", {"action": "ssl"}, cookie=user_cookie)[0], 403, "non-admins can't provision")
+        self.assertEqual(self.call("/api/status", headers=bearer)[0], 200)
+        self.assertEqual(self.call("/api/users/reset", {"username": name, "password": "password2"}, cookie=cookie)[0], 200)
+        self.assertEqual(self.call("/api/status", headers=bearer)[0], 401)
 
     def test_install_action_validation(self):
         cookie = self.login()

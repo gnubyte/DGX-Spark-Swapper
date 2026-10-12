@@ -453,7 +453,8 @@ async function confirmInstall(m) {
   const i = m.install || {};
   const ok = await ask(`Install ${m.title}?`,
     `${i.time || "This downloads the model and sets it up."}${i.size_gb ? ` It needs about ${i.size_gb} GB of free disk.` : ""} ` +
-    "It runs on the box by itself — you can close this page — and the model that's serving now keeps serving.", "Install");
+    "It runs on the box by itself — you can close this page — and the model that's serving now keeps serving." +
+    (i.note ? ` ${i.note}` : ""), "Install");
   if (!ok) return;
   try {
     await api("/api/models/install", { key: m.key });
@@ -505,7 +506,13 @@ function credRow(label, value, { link = false, src = "" } = {}) {
 }
 
 function renderApiRows(info) {
-  $("api-rows").replaceChildren(
+  const weak = info.api_key === "vllm-local";
+  const warn = el("p", "note slim warn");
+  warn.hidden = !weak;
+  warn.textContent = "This box uses the default API key, vllm-local, which anyone can guess. Set your own \"api_key\" in " +
+    "/etc/spark-swapper/models.json, restart Spark Swapper (sudo systemctl restart spark-swapper), run Provisioning ▸ " +
+    "HTTPS front again, then switch models once.";
+  $("api-rows").replaceChildren(warn,
     credRow("Base URL", info.api_base, { src: "OpenAI-compatible · HTTPS with this box's certificate" }),
     credRow("API key", info.api_key, { src: "Required on every request (Authorization: Bearer …)" }),
     credRow("Model ID", info.model || "", { src: info.model ? `Serving now${info.context ? ` · ${fmtCtx(info.context)} context` : ""} — it changes when you switch models` : "No model is serving right now" }),
@@ -720,7 +727,8 @@ function renderProv(rep, job) {
     if (st.detail) left.append(el("div", "muted small", st.detail));
     row.append(left);
     const btn = el("button", "btn " + (present ? "ghost" : "primary"), present ? (key === "llamacpp" ? "Update" : "Re-run / verify") : "Install");
-    btn.disabled = running;
+    btn.disabled = running || me.role !== "admin";
+    if (me.role !== "admin") btn.title = "Only an admin can run provisioning.";
     btn.addEventListener("click", () => startInstall(key, st));
     row.append(btn);
     box.append(row);
@@ -801,9 +809,9 @@ function renderUpdates(u) {
   $("upd-check").checked = !!u.check;
   $("upd-auto").checked = !!u.auto_install;
   $("upd-auto").disabled = !u.check;
-  $("upd-next").textContent = !u.can_install ? `Automatic installs are off here: ${u.why_not}`
+  $("upd-next").textContent = (u.signed_only ? "Only signed releases are installed. " : "") + (!u.can_install ? `Automatic installs are off here: ${u.why_not}`
     : u.check ? `Next check: ${new Date(u.next_check * 1000).toLocaleString([], { weekday: "long", hour: "2-digit", minute: "2-digit" })}${u.auto_install ? " — a newer version installs right away." : " — you'll see it here."}`
-      : "Weekly checks are off. Use Check now whenever you like.";
+      : "Weekly checks are off. Use Check now whenever you like.");
   const inst = $("btn-upd-install");
   inst.hidden = !u.available;
   inst.disabled = u.busy || !u.can_install;
@@ -930,7 +938,7 @@ $("au-ok").addEventListener("click", async (ev) => {
 let resetFor = null;
 function openReset(username) {
   resetFor = username;
-  $("reset-pw-who").textContent = `New password for ${username}. This signs out their existing sessions.`;
+  $("reset-pw-who").textContent = `New password for ${username}. This signs out their existing sessions and app connections.`;
   $("rp-err").textContent = "";
   $("rp-pass").value = "";
   $("reset-pw").showModal();
@@ -1002,7 +1010,7 @@ $("pw-ok").addEventListener("click", async (ev) => {
   try {
     await api("/api/password", { current: $("pw-cur").value, new: $("pw-new").value });
     $("pw").close();
-    toast("Password changed. Your other sessions were signed out.");
+    toast("Password changed. Your other sessions and app connections were signed out.");
   } catch (e) { $("pw-err").textContent = e.message; }
 });
 
