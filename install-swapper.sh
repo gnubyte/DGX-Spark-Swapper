@@ -11,7 +11,7 @@
 #      generates a self-signed cert, substitutes the placeholders in
 #      models.json with real values, and starts the systemd service.
 #
-# Requires: an Ubuntu/Debian DGX Spark with root access (sudo).
+# Requires: an Ubuntu/Debian box — a DGX Spark or an AMD Strix Halo — with root access (sudo).
 set -euo pipefail
 
 REPO="https://github.com/gnubyte/DGX-Spark-Swapper"
