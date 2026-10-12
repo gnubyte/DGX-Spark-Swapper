@@ -475,7 +475,7 @@ class Handler(BaseHTTPRequestHandler):
             if not action.startswith("model:") and (role != "admin" or user.get("via") == "token"):
                 return self._json(403, {"error": "Only an admin signed in to this page can run provisioning."})
             try:
-                job = self.installer.begin(action)
+                job = self.installer.begin(action, allow_infra=role == "admin" and user.get("via") == "cookie")
             except RuntimeError as e:
                 return self._json(409, {"error": str(e)})
             return self._json(202, {"ok": True, "job": job.to_dict()})

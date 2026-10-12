@@ -379,7 +379,9 @@ class Installer:
         return {"present": enough, "detail": detail, "pending_reboot": pending, **gpu}
 
     # ── jobs ──
-    def begin(self, action: str) -> Job:
+    def begin(self, action: str, allow_infra: bool = True) -> Job:
+        """Start an install job. With allow_infra False (a non-admin, or an app
+        token), a model install won't install missing infrastructure for itself."""
         if action not in self.ACTIONS:
             raise ValueError("unknown action")
         if self.engine.updating():
@@ -394,17 +396,17 @@ class Installer:
                 job = Job(f"install:{action}", None, ["run"])
                 job.steps[0]["label"] = f"Installing {INFRA.get(action, (action,))[0]}"
             self.job = job
-            threading.Thread(target=self._run, args=(job, action), daemon=True).start()
+            threading.Thread(target=self._run, args=(job, action, allow_infra), daemon=True).start()
             return job
         except Exception:
             self._lock.release()
             raise
 
-    def _run(self, job: Job, action: str):
+    def _run(self, job: Job, action: str, allow_infra: bool = True):
         cur = "run"
         try:
             if action.startswith("model:"):
-                self._do_model(job, action.split(":", 1)[1])
+                self._do_model(job, action.split(":", 1)[1], allow_infra)
             else:
                 job.step(cur, "running")
                 getattr(self, f"_do_{action}")(job)
@@ -770,7 +772,7 @@ class Installer:
         job.say(job.note)
 
     # ── models ──
-    def _do_model(self, job: Job, key: str):
+    def _do_model(self, job: Job, key: str, allow_infra: bool = True):
         m = self.engine.models.get(key)
         if not m or not m.get("install"):
             raise InstallFailed("That model has no install steps.")
@@ -789,6 +791,9 @@ class Installer:
                 job.say(f"⚠ {label}: {state.get('detail')} The download goes ahead; the model won't start "
                         "until the limit is raised (Provisioning tab) and the box rebooted.")
                 continue
+            if not allow_infra:
+                raise InstallFailed(f"{m['title']} needs {label}, which isn't installed. An admin can install it "
+                                    "on the Provisioning tab (signed in to the page), then install this model.")
             job.say(f"{label} is missing — installing it first.")
             getattr(self, f"_do_{req}")(job)
         job.step("requires", "done")
