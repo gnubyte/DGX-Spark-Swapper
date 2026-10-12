@@ -1,16 +1,25 @@
-"""Swap engine: knows how to stop, start and verify each model on the Spark,
+"""Swap engine: knows how to stop, start and verify each model on the box,
 and how to repoint OpenClaw at whichever one is live.
 
-Everything here runs as root (docker and the root-owned Flash recipe need it).
-One swap at a time; every step is logged into the Job the web UI polls.
+Model kinds:
+  sglang-docker   one docker container kept between runs (docker start/stop)
+  flash-vllm      the original Flash Next recipe's start.sh / stop.sh, run as root
+  recipe-script   a recipe whose start.sh / stop.sh run one docker container, run
+                  as the box's user (TensorFold 27B and Flash Next, Nemotron)
+  llamacpp        llama.cpp's llama-server as a transient systemd unit (Strix Halo)
+
+Everything here runs as root (docker, systemd and the root-owned Flash recipe
+need it). One swap at a time; every step is logged into the Job the web UI polls.
 """
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import os
 import re
-import shlex
 import signal
+import socket
 import ssl
 import subprocess
 import threading
@@ -21,8 +30,33 @@ import uuid
 from collections import deque
 from pathlib import Path
 
+import config as config_mod
+import hardware
+
 ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 DEMO = os.environ.get("SWAPPER_DEMO", "") == "1"
+ROOT = Path(__file__).resolve().parent
+DEFAULT_STATE = Path("/var/lib/spark-swapper")
+FRONT_CONF = Path("/etc/nginx/conf.d/spark-model-front.conf")
+FRONT_MARK = "# Written by Spark Swapper"
+_SECRETISH = re.compile(r"KEY|TOKEN|SECRET|PASSWORD", re.I)
+
+
+def key_digest(key: str) -> str:
+    """How the HTTPS front's config records which API key it enforces."""
+    return hashlib.sha256(key.encode()).hexdigest()
+
+
+def shown_env(env: dict) -> str:
+    """K=V pairs for a log line, with secret-looking values hidden."""
+    return " ".join(f"{k}={'•••' if _SECRETISH.search(k) else v}" for k, v in env.items())
+
+
+def app_version() -> str:
+    try:
+        return (ROOT / "VERSION").read_text().strip() or "0.0.0"
+    except OSError:
+        return "0.0.0"
 
 
 # ─────────────────────────────── helpers ────────────────────────────────
@@ -36,7 +70,7 @@ def sh(cmd: list[str], timeout: float = 60, env: dict | None = None,
         return p.returncode, (p.stdout + p.stderr).strip()
     except subprocess.TimeoutExpired:
         return 124, f"timed out after {timeout:.0f}s: {' '.join(cmd[:3])}"
-    except FileNotFoundError as e:
+    except (FileNotFoundError, NotADirectoryError, PermissionError) as e:
         return 127, str(e)
 
 
@@ -53,6 +87,13 @@ def meminfo() -> dict:
             "free": round(out.get("MemFree", 0), 1)}
 
 
+def _tls_context() -> ssl.SSLContext:
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE  # our own self-signed nginx front
+    return ctx
+
+
 def http_json(url: str, key: str | None = None, timeout: float = 4,
               body: dict | None = None) -> dict | None:
     headers = {"Content-Type": "application/json"}
@@ -60,21 +101,46 @@ def http_json(url: str, key: str | None = None, timeout: float = 4,
         headers["Authorization"] = f"Bearer {key}"
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(url, data=data, headers=headers)
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE  # our own self-signed nginx front
     try:
-        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as r:
+        with urllib.request.urlopen(req, timeout=timeout, context=_tls_context()) as r:
             return json.loads(r.read().decode() or "{}")
     except (urllib.error.URLError, OSError, ValueError, TimeoutError):
         return None
 
 
+def http_status(url: str, key: str | None = None, timeout: float = 5) -> int | None:
+    """Just the HTTP status of a GET (None when nothing answered)."""
+    headers = {"Authorization": f"Bearer {key}"} if key else {}
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=timeout,
+                                    context=_tls_context()) as r:
+            return r.status
+    except urllib.error.HTTPError as e:
+        return e.code
+    except (urllib.error.URLError, OSError, TimeoutError):
+        return None
+
+
 def port_open(port: int, host: str = "127.0.0.1") -> bool:
-    import socket
     with socket.socket() as s:
         s.settimeout(0.5)
         return s.connect_ex((host, port)) == 0
+
+
+def cert_fingerprint(cert_path: Path) -> str | None:
+    """SHA-256 of the certificate's DER, as AA:BB:… (what DSH pins)."""
+    try:
+        pem = Path(cert_path).read_text()
+    except OSError:
+        return None
+    m = re.search(r"-----BEGIN CERTIFICATE-----(.+?)-----END CERTIFICATE-----", pem, re.S)
+    if not m:
+        return None
+    try:
+        der = base64.b64decode("".join(m.group(1).split()))
+    except ValueError:
+        return None
+    return ":".join(f"{b:02X}" for b in hashlib.sha256(der).digest())
 
 
 # ─────────────────────────────── the job ────────────────────────────────
@@ -82,15 +148,23 @@ def port_open(port: int, host: str = "127.0.0.1") -> bool:
 STEP_LABELS = {
     "prepare": "Getting ready",
     "stop": "Stopping the current model",
-    "memory": "Waiting for GPU memory to free up",
+    "memory": "Waiting for memory to free up",
     "start": "Loading the new model",
-    "verify": "Checking it answers",
+    "verify": "Checking it answers (and how fast)",
     "openclaw": "Pointing OpenClaw at it",
     "rollback": "Restoring the previous model",
+    "run": "Installing",
+    "requires": "Checking what it needs",
+    "fetch": "Downloading and setting up",
+    "check": "Checking it's ready",
 }
 
 
 class SwapFailed(Exception):
+    pass
+
+
+class NotInstalled(ValueError):
     pass
 
 
@@ -110,7 +184,7 @@ class Job:
         self._lock = threading.Lock()
 
     def say(self, msg: str):
-        msg = ANSI.sub("", msg).rstrip()
+        msg = ANSI.sub("", msg or "").rstrip()
         if not msg:
             return
         with self._lock:
@@ -149,14 +223,31 @@ class Job:
 # ─────────────────────────────── the engine ─────────────────────────────
 
 class Engine:
-    def __init__(self, config_path: Path, state_dir: Path):
-        self.config_path = config_path
-        self.state_dir = state_dir
+    def __init__(self, config_path: Path, state_dir: Path, catalog_path: Path | None = None,
+                 conf_dir: Path | None = None):
+        self.config_path = Path(config_path)
+        self.catalog_path = Path(catalog_path) if catalog_path else ROOT / "catalog.json"
+        self.conf_dir = Path(conf_dir) if conf_dir else self.config_path.parent
+        self.state_dir = Path(state_dir)
         self.state_dir.mkdir(parents=True, exist_ok=True)
-        self.cfg = json.loads(config_path.read_text())
+        self.version = app_version()
+        site = config_mod.load_site(self.config_path)   # a broken config stops here, loudly
+        # Model weights and llama.cpp builds live outside the 0700 state dir so a
+        # sandboxed (unprivileged) llama-server can read them.
+        self.runtime_dir = Path(os.environ.get("SWAPPER_RUNTIME") or (
+            "/var/lib/spark-swapper-runtime" if self.state_dir == DEFAULT_STATE else self.state_dir / "runtime"))
+        if DEMO:
+            self.platform = os.environ.get("SWAPPER_DEMO_PLATFORM", hardware.NVIDIA_GB10)
+            self.platform_evidence = "demo"
+        else:
+            self.platform, self.platform_evidence = hardware.detect(sh, site.get("platform"))
+        self.cfg = config_mod.merge(site, config_mod.load_json(self.catalog_path, {}) or {}, self.platform)
         self.job: Job | None = None
         self._swap_lock = threading.Lock()
+        self._state_lock = threading.Lock()
         self._status_cache: tuple[float, dict] | None = None
+        self._install_cache: dict[str, tuple[float, dict]] = {}
+        self._mtp_cache: dict[str, bool] = {}
 
     # ── persistent state ──
     @property
@@ -170,11 +261,22 @@ class Engine:
             return {}
 
     def save_state(self, **kv):
-        st = self.load_state()
-        st.update(kv)
-        tmp = self._state_file.with_suffix(".tmp")
-        tmp.write_text(json.dumps(st, indent=2))
-        tmp.replace(self._state_file)
+        with self._state_lock:
+            st = self.load_state()
+            st.update(kv)
+            tmp = self._state_file.with_suffix(".tmp")
+            tmp.write_text(json.dumps(st, indent=2))
+            tmp.replace(self._state_file)
+
+    def update_state(self, key: str, fn):
+        """Read-modify-write one top-level state entry under the lock."""
+        with self._state_lock:
+            st = self.load_state()
+            st[key] = fn(st.get(key))
+            tmp = self._state_file.with_suffix(".tmp")
+            tmp.write_text(json.dumps(st, indent=2))
+            tmp.replace(self._state_file)
+            return st[key]
 
     @property
     def models(self) -> dict:
@@ -184,75 +286,282 @@ class Engine:
     def key(self) -> str:
         return self.cfg.get("api_key", "vllm-local")
 
+    @property
+    def api_port(self) -> int:
+        return int(self.cfg.get("api_port", 8888))
+
+    @property
+    def user(self) -> str:
+        return (self.cfg.get("openclaw") or {}).get("user") or "root"
+
+    @property
+    def home(self) -> str:
+        return config_mod.site_values(self.cfg)["HOME"]
+
+    @property
+    def models_dir(self) -> Path:
+        return self.runtime_dir / "models"
+
+    @staticmethod
+    def own_key(m: dict) -> bool:
+        """Whether the model's server checks the API key itself. Recipe scripts
+        whose servers can't (TensorFold 27B, Nemotron) rely on the HTTPS front."""
+        if "own_key" in m:
+            return bool(m["own_key"])
+        return m["kind"] != "recipe-script"
+
+    def updating(self) -> bool:
+        """A self-update has been handed to deploy/update.sh and hasn't reported back."""
+        try:
+            r = json.loads((self.state_dir / "update-result.json").read_text())
+        except (OSError, ValueError):
+            return False
+        return r.get("state") == "running" and time.time() - (r.get("started") or 0) < 1800
+
+    def hostname(self) -> str:
+        return os.uname().nodename if hasattr(os, "uname") else socket.gethostname()
+
     # ── observation ──
     def running_containers(self) -> set[str]:
         rc, out = sh(["docker", "ps", "--format", "{{.Names}}"], timeout=15)
         return set(out.split()) if rc == 0 else set()
 
+    def active_units(self) -> set[str]:
+        """Our llama.cpp units that systemd says are running (or starting)."""
+        if not any(m["kind"] == "llamacpp" for m in self.models.values()):
+            return set()
+        rc, out = sh(["systemctl", "list-units", "--type=service", "--all", "--no-legend", "--plain",
+                      "swapper-llama-*"], timeout=10)
+        units = set()
+        if rc == 0:
+            for line in out.splitlines():
+                parts = line.split()
+                if len(parts) >= 4 and parts[2] in ("active", "activating", "reloading"):
+                    units.add(parts[0].removesuffix(".service"))
+        return units
+
     def container_exists(self, name: str) -> bool:
         return sh(["docker", "inspect", name], timeout=15)[0] == 0
 
+    @staticmethod
+    def args_hash(m: dict) -> str:
+        return hashlib.sha256(json.dumps(m.get("docker_run") or []).encode()).hexdigest()[:16]
+
+    def container_current(self, m: dict) -> bool:
+        """Whether the existing container was created with the docker_run we'd
+        use now. Containers we made carry a hash label; older ones (made by 1.x
+        or by hand) are kept unless they use a different API key or port."""
+        rc, out = sh(["docker", "inspect", "-f", '{{index .Config.Labels "swapper.args"}}|{{json .Args}}',
+                      m["container"]], timeout=15)
+        if rc != 0:
+            return False
+        label, _, args_json = out.partition("|")
+        if label and label != "<no value>":
+            return label == self.args_hash(m)
+        try:
+            args = json.loads(args_json) or []
+        except ValueError:
+            return True
+
+        def val(flag):
+            return args[args.index(flag) + 1] if flag in args and args.index(flag) + 1 < len(args) else None
+        return val("--api-key") in (None, self.key) and val("--port") in (None, str(self.api_port))
+
+    def image_exists(self, name: str) -> bool:
+        return sh(["docker", "image", "inspect", name], timeout=15)[0] == 0
+
+    def model_running(self, key: str, containers: set[str], units: set[str]) -> bool:
+        m = self.models[key]
+        if m["kind"] == "llamacpp":
+            return m.get("unit") in units
+        return bool(m.get("container")) and m["container"] in containers
+
     def served(self) -> dict | None:
-        d = http_json(f"http://127.0.0.1:{self.cfg['api_port']}/v1/models", self.key, timeout=3)
+        d = http_json(f"http://127.0.0.1:{self.api_port}/v1/models", self.key, timeout=3)
         if not d or not d.get("data"):
             return None
         m = d["data"][0]
+        # vLLM and SGLang report the window they serve; llama.cpp only the model's
+        # training length, which says nothing about --ctx-size, so it is left out.
         return {"id": m.get("id"), "context": m.get("max_model_len")}
+
+    @staticmethod
+    def serves(m: dict, served: dict | None) -> bool:
+        if not served or not served.get("id"):
+            return False
+        sid = str(served["id"])
+        return sid == m["served_id"] or bool(m.get("served_match") and m["served_match"] in sid)
+
+    # ── installs ──
+    def local_file(self, repo: str, path: str) -> Path:
+        return self.models_dir / repo / path
+
+    @staticmethod
+    def split_ref(ref: str) -> tuple[str, str]:
+        """"owner/repo/dir/file.gguf" → ("owner/repo", "dir/file.gguf")."""
+        owner, _, rest = ref.partition("/")
+        repo, _, path = rest.partition("/")
+        return f"{owner}/{repo}", path
+
+    def file_verified(self, repo: str, path: str) -> bool:
+        f = self.local_file(repo, path)
+        marker = f.with_name(f.name + ".ok")
+        try:
+            info = json.loads(marker.read_text())
+            return f.is_file() and f.stat().st_size == info.get("size")
+        except (OSError, ValueError):
+            return False
+
+    def llama_server(self) -> Path | None:
+        info = self.load_state().get("llamacpp") or {}
+        p = Path(info.get("bin") or "/nonexistent")
+        return p if p.is_file() else None
+
+    def mtp_supported(self, exe: Path) -> bool:
+        k = str(exe)
+        if k not in self._mtp_cache:
+            rc, out = sh([str(exe), "--help"], timeout=30,
+                         env={**os.environ, "LD_LIBRARY_PATH": str(exe.parent)})
+            self._mtp_cache[k] = "draft-mtp" in out
+        return self._mtp_cache[k]
+
+    def _ready(self, m: dict, check: dict) -> tuple[bool, str]:
+        if "file" in check:
+            ok = Path(check["file"]).is_file()
+            return ok, "" if ok else f"missing {check['file']}"
+        if "hf_cached" in check:
+            repo = check["hf_cached"]
+            home = check.get("home") or self.home
+            snaps = Path(home) / ".cache/huggingface/hub" / f"models--{repo.replace('/', '--')}" / "snapshots"
+            ok = any(p.is_dir() for p in snaps.glob("*")) if snaps.is_dir() else False
+            return ok, "" if ok else f"{repo} not downloaded"
+        if "docker_image_or_container" in check:
+            ok = self.image_exists(check["docker_image_or_container"]) or \
+                 (bool(check.get("container")) and self.container_exists(check["container"]))
+            return ok, "" if ok else f"image {check['docker_image_or_container']} not pulled"
+        if "hf_files" in check:
+            missing = [f["path"] for f in m.get("files", []) if not self.file_verified(f["repo"], f["path"])]
+            if missing:
+                return False, f"{len(missing)} file(s) not downloaded"
+            if not self.llama_server():
+                return False, "llama.cpp isn't installed"
+            return True, ""
+        return True, ""
+
+    def install_state(self, key: str, fresh: bool = False) -> dict:
+        """{"installed": bool, "detail": str}, cached for 20 s (some checks ask docker)."""
+        now = time.time()
+        hit = self._install_cache.get(key)
+        if hit and not fresh and now - hit[0] < 20:
+            return hit[1]
+        m = self.models[key]
+        if DEMO:
+            demo_missing = {"nemotron", "halo27b-q8", "haloflash", "flash"}
+            st = {"installed": key not in demo_missing, "detail": "" if key not in demo_missing else "not downloaded"}
+        elif m["kind"] == "flash-vllm":
+            d = Path(m.get("dir", ""))
+            ok = (d / "start.sh").is_file() and (d / ".env").is_file()
+            st = {"installed": ok, "detail": "" if ok else f"recipe not at {d}"}
+        elif m["kind"] == "sglang-docker" and not (m.get("install") or {}).get("ready"):
+            st = {"installed": True, "detail": ""}
+        else:
+            results = [self._ready(m, c) for c in (m.get("install") or {}).get("ready", [])]
+            bad = [why for ok, why in results if not ok]
+            st = {"installed": not bad, "detail": "; ".join(bad)}
+        self._install_cache[key] = (now, st)
+        return st
+
+    def forget_install_cache(self):
+        self._install_cache.clear()
+        self._status_cache = None
+
+    # ── status ──
+    def front_state(self) -> dict:
+        """Is the :11443 HTTPS front up, did Spark Swapper write it, and does it
+        check the API key this box uses now (it records a hash of the key)."""
+        if DEMO:
+            return {"up": True, "ours": True, "enforces_key": True}
+        try:
+            text = FRONT_CONF.read_text(errors="replace")
+        except OSError:
+            text = ""
+        ours = FRONT_MARK in text
+        enforces = ours and bool(self.key) and f"# api-key-sha256: {key_digest(self.key)}" in text
+        return {"up": port_open(self.cfg.get("nginx_port", 11443)), "ours": ours, "enforces_key": enforces}
+
+    def model_summary(self, key: str, m: dict, running: bool, healthy: bool, served: dict | None,
+                      measured: dict) -> dict:
+        inst = self.install_state(key)
+        install = m.get("install") or {}
+        return {
+            "key": key, "title": m["title"], "tagline": m.get("tagline", ""),
+            "engine": m.get("engine", ""), "context": m["context"],
+            "served_context": (served or {}).get("context") if healthy else None,
+            "served_id": m["served_id"], "vision": m.get("vision", False),
+            "running": running, "healthy": healthy,
+            "order": m.get("order", 9),
+            "platform": self.platform,
+            "family": m.get("family"),
+            "kind": m["kind"],
+            "installed": inst["installed"],
+            "install_detail": inst["detail"],
+            "install": {"size_gb": install.get("size_gb"), "time": install.get("time"),
+                        "requires": install.get("requires", []), "note": install.get("note")} if install else None,
+            "perf": m.get("perf"),
+            "measured": measured.get(key),
+            "recommended": bool(m.get("recommended")),
+            "superseded_by": m.get("superseded_by"),
+            "eta": m.get("eta"),
+            "repo": m.get("repo"),
+            "anthropic_api": bool(m.get("anthropic_api")),
+        }
 
     def status(self, fresh: bool = False) -> dict:
         now = time.time()
         if not fresh and self._status_cache and now - self._status_cache[0] < 2.5:
             return self._status_cache[1]
+        st = self.load_state()
+        measured = st.get("measured") or {}
         if DEMO:
-            running, served = set(), {"id": "qwen3.8-27b-sglang", "context": 1000000}
+            demo_active = next((k for k, m in self.models.items() if m.get("recommended")), None) \
+                or next(iter(self.models), None)
+            containers, units = set(), set()
+            served = {"id": self.models[demo_active]["served_id"], "context": self.models[demo_active]["context"]} \
+                if demo_active else None
         else:
-            running = self.running_containers()
+            containers = self.running_containers()
+            units = self.active_units()
             served = self.served()
         models = {}
         active = None
         for key, m in self.models.items():
-            is_running = m["container"] in running
-            healthy = bool(served and served["id"] == m["served_id"])
+            is_running = self.model_running(key, containers, units)
+            healthy = self.serves(m, served)
             if healthy:
                 active = key
-            models[key] = {
-                "key": key, "title": m["title"], "tagline": m.get("tagline", ""),
-                "engine": m.get("engine", ""), "context": m["context"],
-                "served_context": served["context"] if healthy else None,
-                "served_id": m["served_id"], "vision": m.get("vision", False),
-                "running": is_running, "healthy": healthy,
-                "order": m.get("order", 9),
-            }
+                is_running = True
+            models[key] = self.model_summary(key, m, is_running, healthy, served, measured)
         loading = [k for k, v in models.items() if v["running"] and not v["healthy"]]
-        st = self.load_state()
-        if DEMO:
-            mem = {"total": 128.0, "available": 97.4, "free": 41.2}
-            out = {
-                "active": "standard",
-                "loading": None,
-                "desired": "standard",
-                "last_swap": {"to": "standard", "from": "flash", "at": time.time() - 86400, "ok": True},
-                "models": models,
-                "memory": mem,
-                "openclaw_primary": "sglang/qwen3.8-27b-sglang",
-                "nginx": True,
-                "gateway": True,
-                "busy": bool(self.job and self.job.state == "running"),
-            }
-            self._status_cache = (now, out)
-            return out
         out = {
             "active": active,
             "loading": loading[0] if loading and not active else None,
             "desired": st.get("desired"),
             "last_swap": st.get("last_swap"),
             "models": models,
-            "memory": meminfo(),
-            "openclaw_primary": self.openclaw_primary(),
-            "nginx": port_open(self.cfg.get("nginx_port", 11443)),
-            "gateway": port_open(self.cfg["openclaw"].get("gateway_port", 18789)),
+            "memory": {"total": 128.0, "available": 97.4, "free": 41.2} if DEMO else meminfo(),
+            "openclaw_primary": self.openclaw_primary() if not DEMO else
+                (f"{self.models[active]['openclaw_provider']}/{self.models[active]['served_id']}" if active else None),
+            "nginx": True if DEMO else port_open(self.cfg.get("nginx_port", 11443)),
+            "front": self.front_state(),
+            "gateway": True if DEMO else port_open(self.cfg["openclaw"].get("gateway_port", 18789)),
             "busy": bool(self.job and self.job.state == "running"),
+            "version": self.version,
+            "platform": self.platform,
+            "platform_label": hardware.label(self.platform),
+            "hostname": self.hostname(),
         }
+        if self.platform == hardware.AMD_STRIX_HALO:
+            out["gpu"] = {"vram_gib": 0.5, "gtt_gib": 108.0, "total_gib": 108.5} if DEMO else hardware.amd_gpu_memory()
         self._status_cache = (now, out)
         return out
 
@@ -293,12 +602,15 @@ class Engine:
         m = self.models[key]
         return f"{m['openclaw_provider']}/{m['served_id']}"
 
+    def openclaw_installed(self) -> bool:
+        oc = self.cfg.get("openclaw") or {}
+        return bool(oc.get("bin")) and Path(oc["bin"]).exists()
+
     def openclaw_point_to(self, key: str, job: Job):
         m = self.models[key]
         ref = self.openclaw_ref(key)
-        port = self.cfg["api_port"]
         provider = {
-            "baseUrl": f"http://127.0.0.1:{port}/v1",
+            "baseUrl": f"http://127.0.0.1:{self.api_port}/v1",
             "apiKey": self.key,
             "api": "openai-completions",
             "timeoutSeconds": 10800,
@@ -315,13 +627,17 @@ class Engine:
                 "compat": {"supportsTools": True, "supportsUsageInStreaming": True},
             }],
         }
+        defaults = {
+            "model": {"primary": ref},
+            "compaction": {"model": ref, "memoryFlush": {"model": ref}},
+        }
+        if m.get("vision"):
+            defaults["imageModel"] = ref
+        else:
+            job.say("This model can't see images, so OpenClaw's image model is left as it was.")
         patch = {
             "models": {"providers": {m["openclaw_provider"]: provider}},
-            "agents": {"defaults": {
-                "model": {"primary": ref},
-                "imageModel": ref,
-                "compaction": {"model": ref, "memoryFlush": {"model": ref}},
-            }},
+            "agents": {"defaults": defaults},
         }
         oc_bin = self.cfg["openclaw"]["bin"]
         replace = f"models.providers.{m['openclaw_provider']}.models"
@@ -351,24 +667,78 @@ class Engine:
         if got != ref:
             raise SwapFailed(f"OpenClaw read-back shows {got!r}, expected {ref!r}.")
 
+    # ── running things as the box's user ──
+    def user_env(self, extra: dict | None = None) -> dict:
+        home, user = self.home, self.user
+        env = {"HOME": home, "USER": user, "LOGNAME": user, "LANG": "C.UTF-8",
+               "PATH": f"{home}/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"}
+        env.update({k: str(v) for k, v in (extra or {}).items()})
+        return env
+
+    def as_user(self, cmd: list[str], env: dict | None = None) -> tuple[list[str], dict]:
+        """(argv, env) running `cmd` as the box's user with a clean environment.
+        setpriv keeps the process in our process group (runuser starts a new
+        session), so a timeout can stop everything the command started; the
+        environment is passed directly, so values like API keys never show up
+        in `ps`."""
+        envd = self.user_env(env)
+        if os.geteuid() == 0 and self.user != "root":
+            import pwd
+            import shutil
+            pw = pwd.getpwnam(self.user)
+            if shutil.which("setpriv"):
+                return ["setpriv", f"--reuid={pw.pw_uid}", f"--regid={pw.pw_gid}", "--init-groups", "--", *cmd], envd
+            return ["runuser", "-u", self.user, "--", *cmd], envd
+        return list(cmd), envd
+
+    def run_cmd(self, m_or_step: dict, cmd: list[str], env: dict | None = None) -> tuple[list[str], dict]:
+        """(argv, env) for a recipe command honouring "as" / "run_as" (user | root)."""
+        who = m_or_step.get("as") or m_or_step.get("run_as") or "root"
+        if who == "user":
+            return self.as_user(cmd, env)
+        return list(cmd), {**os.environ, "HOME": "/root", **{k: str(v) for k, v in (env or {}).items()}}
+
+    def ensure_docker_group(self, job: Job):
+        """Recipes run their containers as the box's user, who must be in the docker group."""
+        if DEMO or self.user == "root" or os.geteuid() != 0:
+            return
+        rc, out = sh(["id", "-nG", self.user], timeout=10)
+        if rc == 0 and "docker" not in out.split():
+            rc2, out2 = sh(["usermod", "-aG", "docker", self.user], timeout=20)
+            job.say(f"Added {self.user} to the docker group so recipes can start their container."
+                    if rc2 == 0 else f"Couldn't add {self.user} to the docker group: {out2}")
+
     # ── per-backend stop / start ──
     def stop_model(self, key: str, job: Job):
         m = self.models[key]
-        if m["kind"] == "sglang-docker":
+        kind = m["kind"]
+        if kind == "sglang-docker":
             # Keep the container (fast restart) but stop docker from reviving it at boot.
             sh(["docker", "update", "--restart", "no", m["container"]], timeout=20)
             job.say(f"docker stop {m['container']} (up to 60s for a clean shutdown)")
             rc, out = sh(["docker", "stop", "-t", "60", m["container"]], timeout=90)
             job.say(out)
-        elif m["kind"] == "flash-vllm":
+        elif kind == "flash-vllm":
             job.say("Running the Flash recipe's stop.sh (graceful, frees shared memory)")
             rc, out = sh(["bash", "./stop.sh"], cwd=m["dir"], timeout=120,
                          env={**os.environ, "HOME": "/root"})
             job.say(out)
             if m["container"] in self.running_containers():
                 sh(["docker", "rm", "-f", m["container"]], timeout=60)
+        elif kind == "recipe-script":
+            job.say(f"Running {m['title']}'s stop script")
+            argv, env = self.run_cmd(m, m.get("stop") or ["bash", "./stop.sh"],
+                                     {"PORT": self.api_port, **(m.get("env") or {})})
+            rc, out = sh(argv, cwd=m["dir"], timeout=180, env=env)
+            job.say(out)
+            if m["container"] in self.running_containers():
+                sh(["docker", "rm", "-f", m["container"]], timeout=60)
+        elif kind == "llamacpp":
+            job.say(f"systemctl stop {m['unit']}")
+            rc, out = sh(["systemctl", "stop", m["unit"]], timeout=60)
+            job.say(out)
         for _ in range(60):
-            if m["container"] not in self.running_containers():
+            if not self.model_running(key, self.running_containers(), self.active_units()):
                 job.say(f"{m['title']} is stopped.")
                 return
             time.sleep(1)
@@ -423,38 +793,92 @@ class Engine:
 
     def preflight(self, key: str, job: Job):
         m = self.models[key]
-        if m["kind"] == "flash-vllm":
+        kind = m["kind"]
+        if kind == "flash-vllm":
             d = Path(m["dir"])
             if not (d / "start.sh").is_file() or not (d / ".env").is_file():
                 raise SwapFailed(f"Flash recipe not found at {d} (need start.sh and .env).")
             if not self._checkpoint_home(m):
                 raise SwapFailed(f"Flash checkpoint {m['checkpoint']} is not in any Hugging Face cache. Run download.sh first.")
-        elif m["kind"] == "sglang-docker":
+        elif kind == "sglang-docker":
             if not self.container_exists(m["container"]):
                 job.say(f"Container {m['container']} is missing — it will be recreated from the saved recipe.")
+        elif kind == "recipe-script":
+            if not (Path(m["dir"]) / "start.sh").is_file():
+                raise SwapFailed(f"{m['title']} isn't installed (no recipe at {m['dir']}). Install it from the Models tab.")
+            if m.get("run_as") == "user":
+                self.ensure_docker_group(job)
+        if not self.own_key(m) and self.key and not self.cfg.get("allow_open_front"):
+            front = self.front_state()
+            if front["up"] and not front["enforces_key"]:
+                ng = self.cfg.get("nginx_port", 11443)
+                why = "it was set up for a different key" if front["ours"] else "Spark Swapper didn't set it up"
+                raise SwapFailed(
+                    f"{m['title']}'s server doesn't check the API key, and the HTTPS front on :{ng} doesn't "
+                    f"either ({why}) — anyone on your network could use the model. Run Provisioning ▸ "
+                    f"HTTPS front, then switch again. (To allow it anyway, set \"allow_open_front\": true "
+                    f"in {self.config_path}.)")
+        elif kind == "llamacpp":
+            if not self.llama_server():
+                raise SwapFailed("llama.cpp isn't installed. Install it from the Provisioning tab.")
+            missing = [f["path"] for f in m.get("files", []) if not self.file_verified(f["repo"], f["path"])]
+            if missing:
+                raise SwapFailed(f"{m['title']} isn't downloaded yet ({len(missing)} file(s) missing). Install it from the Models tab.")
+            gpu = hardware.amd_gpu_memory()
+            need = m.get("gpu_gib")
+            if gpu and need and gpu["total_gib"] < need:
+                raise SwapFailed(
+                    f"{m['title']} needs about {need} GiB of GPU memory, but the GPU may only use "
+                    f"{gpu['total_gib']:.0f} GiB right now. Raise the limit on the Provisioning tab "
+                    f"(\"GPU memory limit\"), reboot, then try again.")
         mem = meminfo()
         job.say(f"Host memory: {mem['available']:.0f} GiB available of {mem['total']:.0f} GiB.")
+
+    def llama_argv(self, key: str) -> list[str]:
+        m = self.models[key]
+        exe = self.llama_server()
+        if not exe:
+            raise SwapFailed("llama.cpp isn't installed.")
+        argv = [str(exe), "--model", str(self.local_file(*self.split_ref(m["model_file"]))),
+                "--alias", m["served_id"],
+                "--host", "127.0.0.1", "--port", str(self.api_port)]
+        if self.key:
+            argv += ["--api-key", self.key]
+        argv += list(m.get("args") or [])
+        if m.get("spec_args") and self.mtp_supported(exe):
+            if m.get("draft_file"):
+                argv += ["-md", str(self.local_file(*self.split_ref(m["draft_file"])))]
+            argv += list(m["spec_args"])
+        return argv
 
     def start_model(self, key: str, job: Job):
         m = self.models[key]
         timeout = m.get("start_timeout_s", 1800)
-        if m["kind"] == "sglang-docker":
-            if self.container_exists(m["container"]):
+        kind = m["kind"]
+        if kind == "sglang-docker":
+            exists = self.container_exists(m["container"])
+            if exists and not self.container_current(m):
+                job.say(f"{m['container']} was created with other settings (API key, port or arguments); "
+                        "recreating it — the weights are cached, so only the start takes time.")
+                sh(["docker", "rm", "-f", m["container"]], timeout=60)
+                exists = False
+            if exists:
                 sh(["docker", "update", "--restart", "unless-stopped", m["container"]], timeout=20)
                 rc, out = sh(["docker", "start", m["container"]], timeout=60)
                 job.say(f"docker start {m['container']}: {out}")
                 if rc != 0:
                     raise SwapFailed(f"docker start failed: {out}")
             else:
-                rc, out = sh(["docker", "run", "-d", "--name", m["container"], *m["docker_run"]], timeout=300)
+                rc, out = sh(["docker", "run", "-d", "--name", m["container"],
+                              "--label", f"swapper.args={self.args_hash(m)}", *m["docker_run"]], timeout=300)
                 job.say(out)
                 if rc != 0:
                     raise SwapFailed(f"docker run failed: {out[-400:]}")
             self._wait_healthy(key, job, timeout, proc=None, logfile=None)
-        elif m["kind"] == "flash-vllm":
+        elif kind == "flash-vllm":
             home = self._checkpoint_home(m) or "/root"
             env = {**os.environ, "HOME": home,
-                   "PORT": str(self.cfg["api_port"]), "BIND": "127.0.0.1",
+                   "PORT": str(self.api_port), "BIND": "127.0.0.1",
                    "API_KEY": self.key, "READY_TIMEOUT_S": str(timeout)}
             env.update({k: str(v) for k, v in (m.get("env") or {}).items()})
             logfile = self.state_dir / f"flash-start-{job.id}.log"
@@ -466,15 +890,71 @@ class Engine:
                                         stdout=fh, stderr=subprocess.STDOUT,
                                         stdin=subprocess.DEVNULL, start_new_session=True)
             self._wait_healthy(key, job, timeout + 120, proc=proc, logfile=logfile)
+        elif kind == "recipe-script":
+            env = {"PORT": self.api_port, **(m.get("env") or {})}
+            argv, penv = self.run_cmd(m, m.get("start") or ["bash", "./start.sh"], env)
+            logfile = self.state_dir / f"start-{key}-{job.id}.log"
+            job.say(f"{' '.join(m.get('start') or ['./start.sh'])} in {m['dir']}  ({shown_env(env)})")
+            with open(logfile, "w") as fh:
+                proc = subprocess.Popen(argv, cwd=m["dir"], env=penv, stdout=fh, stderr=subprocess.STDOUT,
+                                        stdin=subprocess.DEVNULL, start_new_session=True)
+            self._wait_healthy(key, job, timeout + 120, proc=proc, logfile=logfile)
+        elif kind == "llamacpp":
+            argv = self.llama_argv(key)
+            exe = Path(argv[0])
+            if not self.mtp_supported(exe) and m.get("spec_args"):
+                job.say("This llama.cpp build has no MTP drafts (--spec-type draft-mtp), so the model runs "
+                        "without them — about half the speed. Update llama.cpp on the Provisioning tab.")
+            unit = m["unit"]
+            sh(["systemctl", "stop", unit], timeout=30)
+            sh(["systemctl", "reset-failed", unit], timeout=10)
+            cmd = ["systemd-run", f"--unit={unit}", "--collect", "--quiet",
+                   "--description", f"Spark Swapper: {m['title']}",
+                   "-p", "Restart=no", "-p", "LimitMEMLOCK=infinity",
+                   f"--setenv=LD_LIBRARY_PATH={exe.parent}", *self.llama_sandbox(), "--", *argv]
+            shown = ["•••" if a == self.key else a for a in argv[1:]]
+            job.say("llama-server " + " ".join(shown))
+            rc, out = sh(cmd, timeout=30)
+            if rc != 0:
+                raise SwapFailed(f"systemd-run failed: {out[-400:]}")
+            self._wait_healthy(key, job, timeout, proc=None, logfile=None, unit=unit)
 
-    def _wait_healthy(self, key: str, job: Job, timeout: float, proc, logfile: Path | None):
+    def llama_sandbox(self) -> list[str]:
+        """systemd-run options that run llama-server as a throwaway unprivileged
+        user with a read-only system, the GPU's device groups and its own cache
+        directory (Mesa keeps compiled shaders there). "llamacpp_sandbox": false
+        in the site config runs it as root instead."""
+        cache = "/var/cache/spark-swapper-llama"
+        if self.cfg.get("llamacpp_sandbox", True) is False:
+            Path(cache).mkdir(parents=True, exist_ok=True)
+            return [f"--setenv=HOME={cache}", f"--setenv=XDG_CACHE_HOME={cache}"]
+        import grp
+        opts = ["-p", "DynamicUser=yes", "-p", "CacheDirectory=spark-swapper-llama",
+                "-p", "ProtectSystem=strict", "-p", "ProtectHome=yes", "-p", "PrivateTmp=yes",
+                "-p", "NoNewPrivileges=yes",
+                f"--setenv=HOME={cache}", f"--setenv=XDG_CACHE_HOME={cache}"]
+        for group in ("render", "video"):
+            try:
+                grp.getgrnam(group)
+                opts += ["-p", f"SupplementaryGroups={group}"]
+            except KeyError:
+                pass
+        return opts
+
+    def _journal(self, unit: str, since: float) -> list[str]:
+        rc, out = sh(["journalctl", "-u", unit, "--since", f"@{int(since)}", "-o", "cat", "--no-pager"], timeout=15)
+        return out.splitlines() if rc == 0 else []
+
+    def _wait_healthy(self, key: str, job: Job, timeout: float, proc, logfile: Path | None,
+                      unit: str | None = None):
         m = self.models[key]
         t0 = time.time()
         pos = 0
+        journal_seen = 0
         last_beat = t0
-        seen_container = False
+        seen_running = False
         while True:
-            # stream the launcher's output (Flash)
+            # stream the launcher's output (recipe scripts)
             if logfile and logfile.exists():
                 with open(logfile, errors="replace") as fh:
                     fh.seek(pos)
@@ -482,11 +962,18 @@ class Engine:
                     pos = fh.tell()
                 if chunk:
                     job.say(chunk)
+            if unit:
+                lines = self._journal(unit, t0 - 5)
+                if len(lines) > journal_seen:
+                    job.say("\n".join(lines[journal_seen:][-60:]))
+                    journal_seen = len(lines)
             s = self.served()
-            if s and s["id"] == m["served_id"]:
-                job.say(f"{m['title']} is serving (context {s['context']:,} tokens) after {int(time.time()-t0)}s.")
+            if self.serves(m, s):
+                ctx = s.get("context")
+                job.say(f"{m['title']} is serving" + (f" (context {ctx:,} tokens)" if isinstance(ctx, int) else "")
+                        + f" after {int(time.time()-t0)}s.")
                 if proc is not None and proc.poll() is None:
-                    # start.sh prints its KV summary right after /health; give it a moment.
+                    # start.sh prints a summary right after the server answers; give it a moment.
                     try:
                         proc.wait(timeout=20)
                     except subprocess.TimeoutExpired:
@@ -496,21 +983,31 @@ class Engine:
                             fh.seek(pos)
                             job.say(fh.read())
                 return
-            running = m["container"] in self.running_containers()
-            seen_container |= running
+            running = self.model_running(key, self.running_containers(), self.active_units())
+            seen_running |= running
             if proc is not None and proc.poll() is not None and proc.returncode != 0:
                 raise SwapFailed(f"{m['title']} launcher exited with code {proc.returncode}. See the log above.")
-            if proc is None and seen_container and not running:
-                _, logs = sh(["docker", "logs", "--tail", "25", m["container"]], timeout=20)
-                job.say(logs)
-                raise SwapFailed(f"{m['title']} container exited while loading.")
+            if proc is None and seen_running and not running:
+                if unit:
+                    tail = self._journal(unit, t0 - 5)[-25:]
+                    job.say("\n".join(tail))
+                    if any(w in " ".join(tail).lower() for w in ("permission denied", "vk_error_initialization_failed",
+                                                                 "no vulkan devices")):
+                        job.say("If llama-server couldn't open the GPU from its sandbox, set "
+                                "\"llamacpp_sandbox\": false in /etc/spark-swapper/models.json and switch again.")
+                else:
+                    _, logs = sh(["docker", "logs", "--tail", "25", m["container"]], timeout=20)
+                    job.say(logs)
+                raise SwapFailed(f"{m['title']} exited while loading.")
             if proc is None and not running and time.time() - t0 > 60:
-                raise SwapFailed(f"{m['title']} container is not running.")
+                raise SwapFailed(f"{m['title']} is not running.")
+            if proc is not None and proc.poll() == 0 and not running and time.time() - t0 > 90:
+                raise SwapFailed(f"{m['title']}'s start script finished but nothing is serving.")
             if time.time() - t0 > timeout:
                 if proc is not None and proc.poll() is None:
                     os.killpg(proc.pid, signal.SIGTERM)
                 raise SwapFailed(f"{m['title']} did not become ready within {int(timeout/60)} minutes.")
-            if proc is None and time.time() - last_beat >= 30:
+            if proc is None and not unit and time.time() - last_beat >= 30:
                 last_beat = time.time()
                 _, tail = sh(["docker", "logs", "--tail", "1", m["container"]], timeout=10)
                 mem = meminfo()
@@ -518,30 +1015,113 @@ class Engine:
                         + (f"  {tail[-160:]}" if tail else ""))
             time.sleep(3)
 
+    def measure(self, key: str, job: Job | None = None, usage: bool = True) -> dict | None:
+        """Stream one ~256-token reply and time it: decode tokens per second after
+        the first token. Returns {"decode", "ttft", "tokens", "reply"} or None when
+        the request failed. Without `usage` the server isn't asked for token counts
+        (for servers that refuse stream_options) and streamed chunks are counted."""
+        m = self.models[key]
+        body = {"model": m["served_id"], "max_tokens": 256, "temperature": 0, "stream": True,
+                "messages": [{"role": "user", "content":
+                              "In one paragraph of about 150 words, explain why the sky is blue."}],
+                "chat_template_kwargs": {"enable_thinking": False}}
+        if usage:
+            body["stream_options"] = {"include_usage": True}
+        req = urllib.request.Request(f"http://127.0.0.1:{self.api_port}/v1/chat/completions",
+                                     data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json",
+                                              "Authorization": f"Bearer {self.key}"})
+        t0 = time.time()
+        first = last = None
+        chunks = 0
+        usage = None
+        text = []
+        try:
+            with urllib.request.urlopen(req, timeout=240) as r:
+                for raw in r:
+                    line = raw.decode(errors="replace").strip()
+                    if not line.startswith("data:"):
+                        continue
+                    data = line[5:].strip()
+                    if data == "[DONE]":
+                        break
+                    try:
+                        ev = json.loads(data)
+                    except ValueError:
+                        continue
+                    if ev.get("usage"):
+                        usage = ev["usage"]
+                    for ch in ev.get("choices") or []:
+                        delta = ch.get("delta") or {}
+                        piece = delta.get("content") or delta.get("reasoning_content") or ""
+                        if piece:
+                            now = time.time()
+                            first = first or now
+                            last = now
+                            chunks += 1
+                            text.append(piece)
+        except (urllib.error.URLError, OSError, ValueError, TimeoutError) as e:
+            if job:
+                job.say(f"Speed check failed: {e}")
+            return None
+        tokens = int((usage or {}).get("completion_tokens") or chunks)
+        if not first or not last or last <= first or tokens < 8:
+            return {"decode": None, "ttft": round(first - t0, 2) if first else None, "tokens": tokens,
+                    "reply": "".join(text)[:80]}
+        return {"decode": round((tokens - 1) / (last - first), 1), "ttft": round(first - t0, 2),
+                "tokens": tokens, "reply": "".join(text)[:80]}
+
     def verify(self, key: str, job: Job):
         m = self.models[key]
         ng = self.cfg.get("nginx_port", 11443)
         d = http_json(f"https://127.0.0.1:{ng}/v1/models", self.key, timeout=8)
-        if d and d.get("data") and d["data"][0].get("id") == m["served_id"]:
-            job.say(f"nginx https://…:{ng}/v1 → {m['served_id']} ✓")
+        if d and d.get("data") and self.serves(m, {"id": d["data"][0].get("id")}):
+            job.say(f"nginx https://…:{ng}/v1 → {d['data'][0].get('id')} ✓")
         else:
             job.say(f"Warning: nginx on :{ng} did not return {m['served_id']} (got {d}).")
-        body = {"model": m["served_id"], "max_tokens": 24, "temperature": 0,
-                "messages": [{"role": "user", "content": "Reply with exactly: ready"}],
-                "chat_template_kwargs": {"enable_thinking": False}}
-        t0 = time.time()
-        r = http_json(f"http://127.0.0.1:{self.cfg['api_port']}/v1/chat/completions",
-                      self.key, timeout=180, body=body)
-        if r and r.get("choices"):
+        front = self.front_state()
+        if front["up"] and not front["enforces_key"] and m["kind"] in ("recipe-script",):
+            job.say(f"Note: this model's server has no API key of its own, and the HTTPS front on :{ng} "
+                    "wasn't set up by Spark Swapper, so it doesn't check the key either. Run "
+                    f"Provisioning ▸ HTTPS front once to make :{ng} require the API key.")
+        # The first request after a load is slow (shader and graph compilation on
+        # some engines); warm up so the speed shown is the one you'll get.
+        http_json(f"http://127.0.0.1:{self.api_port}/v1/chat/completions", self.key, timeout=120,
+                  body={"model": m["served_id"], "max_tokens": 16, "temperature": 0,
+                        "messages": [{"role": "user", "content": "Say hello."}],
+                        "chat_template_kwargs": {"enable_thinking": False}})
+        result = self.measure(key, job) or self.measure(key, job, usage=False)
+        if not result or not result.get("tokens"):
+            # Some servers don't stream the way the speed check expects; a plain
+            # request still proves the model answers.
+            body = {"model": m["served_id"], "max_tokens": 24, "temperature": 0,
+                    "messages": [{"role": "user", "content": "Reply with exactly: ready"}],
+                    "chat_template_kwargs": {"enable_thinking": False}}
+            r = http_json(f"http://127.0.0.1:{self.api_port}/v1/chat/completions", self.key, timeout=180, body=body)
+            if not (r and r.get("choices")):
+                raise SwapFailed("The model is up but did not answer a test prompt.")
             txt = (r["choices"][0].get("message") or {}).get("content") or ""
-            job.say(f"Test reply in {time.time()-t0:.1f}s: {txt.strip()[:80]!r}")
-        else:
-            raise SwapFailed("The model is up but did not answer a test prompt.")
+            job.say(f"Test reply: {txt.strip()[:80]!r} (speed not measured)")
+            return
+        job.say(f"Test reply: {result.get('reply', '').strip()!r}")
+        if result.get("decode"):
+            job.say(f"Speed here: {result['decode']} tokens/s decode, first token after {result['ttft']} s "
+                    f"({result['tokens']} tokens, thinking off).")
+
+            def put(cur):
+                cur = dict(cur or {})
+                cur[key] = {"decode": result["decode"], "ttft": result["ttft"], "at": time.time()}
+                return cur
+            self.update_state("measured", put)
 
     # ── the swap ──
     def begin_swap(self, target: str) -> Job:
         if target not in self.models:
             raise ValueError("unknown model")
+        if self.updating():
+            raise RuntimeError("Spark Swapper is updating itself — try again in a minute.")
+        if not self.install_state(target, fresh=True)["installed"]:
+            raise NotInstalled(f"{self.models[target]['title']} isn't installed yet. Install it first.")
         if not self._swap_lock.acquire(blocking=False):
             raise RuntimeError("A swap is already in progress.")
         try:
@@ -566,8 +1146,8 @@ class Engine:
             job.step(cur, "done")
 
             cur = "stop"; job.step(cur, "running")
-            running = self.running_containers()
-            others = [k for k, m in self.models.items() if k != target and m["container"] in running]
+            containers, units = self.running_containers(), self.active_units()
+            others = [k for k in self.models if k != target and self.model_running(k, containers, units)]
             if not others:
                 job.say("Nothing else is running.")
             for k in others:
@@ -578,7 +1158,7 @@ class Engine:
                 job.say(f"{self.models[target]['title']} is already serving — skipping the load.")
                 job.step("memory", "skipped"); job.step("start", "skipped")
             else:
-                if self.models[target]["container"] in self.running_containers():
+                if self.model_running(target, self.running_containers(), self.active_units()):
                     job.say("Target is half-loaded; restarting it cleanly.")
                     self.stop_model(target, job)
                 cur = "memory"; job.step(cur, "running")
@@ -593,16 +1173,26 @@ class Engine:
             job.step(cur, "done")
 
             cur = "openclaw"; job.step(cur, "running")
-            if self.openclaw_primary() == self.openclaw_ref(target) and already:
+            oc_note = None
+            if not self.openclaw_installed():
+                job.say("OpenClaw isn't installed on this box — skipping. (Install it on the Provisioning tab.)")
+                job.step(cur, "skipped")
+            elif self.openclaw_primary() == self.openclaw_ref(target) and already:
                 job.say("OpenClaw already points here.")
                 job.step(cur, "skipped")
             else:
-                self.openclaw_point_to(target, job)
-                job.step(cur, "done")
-
+                try:
+                    self.openclaw_point_to(target, job)
+                    job.step(cur, "done")
+                    oc_note = "Existing OpenClaw chats may still remember the old model — start a new chat if one errors."
+                except SwapFailed as e:
+                    # The model is serving; only OpenClaw is behind. Don't throw the switch away.
+                    job.say(f"⚠ {e}")
+                    job.step(cur, "failed", str(e))
+                    oc_note = f"The model is serving, but OpenClaw wasn't repointed: {e}"
             self.save_state(desired=target, last_swap={"to": target, "from": source, "at": time.time(), "ok": True})
             job.state = "done"
-            job.note = "Existing OpenClaw chats may still remember the old model — start a new chat if one errors."
+            job.note = oc_note
         except Exception as e:  # noqa: BLE001 — every failure must reach the UI
             msg = str(e) if isinstance(e, SwapFailed) else f"{type(e).__name__}: {e}"
             job.say(f"✗ {msg}")
@@ -622,12 +1212,11 @@ class Engine:
         job.step("rollback", "running")
         job.say(f"Bringing {self.models[source]['title']} back so you are not left without a model…")
         try:
-            tm = self.models[job.target]
-            if tm["container"] in self.running_containers():
+            if self.model_running(job.target, self.running_containers(), self.active_units()):
                 self.stop_model(job.target, job)
             self.wait_memory(source, job)
             self.start_model(source, job)
-            if self.openclaw_primary() != self.openclaw_ref(source):
+            if self.openclaw_installed() and self.openclaw_primary() != self.openclaw_ref(source):
                 self.openclaw_point_to(source, job)
             job.step("rollback", "done")
             job.note = f"{self.models[source]['title']} was restored and is serving again."
@@ -640,7 +1229,8 @@ class Engine:
     def reconcile_at_boot(self):
         """If nothing is serving a few minutes after the service starts, bring
         up the model that was last chosen. Docker already revives SGLang on its
-        own (restart=unless-stopped), so in practice this only restarts Flash."""
+        own (restart=unless-stopped), so in practice this restarts the recipe
+        scripts and llama.cpp, whose servers don't survive a reboot."""
         st0 = self.load_state()
         if "desired" not in st0:
             # First run: adopt whatever is serving now as the baseline.
@@ -656,24 +1246,59 @@ class Engine:
         if self.job and self.job.state == "running":
             return
         st = self.status(fresh=True)
-        if st["active"] or st["loading"] or port_open(self.cfg["api_port"]):
+        if st["active"] or st["loading"] or port_open(self.api_port):
             return
         try:
             self.begin_swap(desired)
-        except RuntimeError:
+        except (RuntimeError, ValueError):
             pass
 
-    # ── credentials ──
-    def credentials(self) -> dict:
-        host = self.cfg.get("public_host") or "127.0.0.1"
+    # ── credentials / connecting ──
+    def public_host(self, request_host: str | None = None) -> str:
+        """The address other machines should use: the one the browser used to
+        reach this page (unless that was localhost), else the configured one."""
+        if request_host:
+            h = request_host.strip()
+            if h.startswith("["):
+                h = h[1:h.index("]")] if "]" in h else h
+            elif h.count(":") == 1:
+                h = h.split(":", 1)[0]
+            if h and h not in ("localhost", "127.0.0.1", "::1"):
+                return h
+        return self.cfg.get("public_host") or "127.0.0.1"
+
+    def connect_info(self, cert_path: Path, port: int, request_host: str | None = None) -> dict:
+        host = self.public_host(request_host)
+        hp = f"[{host}]" if ":" in host else host
+        ng = self.cfg.get("nginx_port", 11443)
+        st = self.status()
+        active = st["models"].get(st["active"] or "") or {}
+        kind = hardware.short(self.platform)
+        return {
+            "name": f"{kind} ({self.hostname()})",
+            "hostname": self.hostname(),
+            "platform": self.platform,
+            "version": self.version,
+            "swapper_url": f"https://{hp}:{port}",
+            "api_base": f"https://{hp}:{ng}/v1",
+            "api_key": self.key,
+            "model": active.get("served_id"),
+            "context": active.get("served_context") or active.get("context"),
+            "fingerprint": cert_fingerprint(cert_path) or (":".join(["00"] * 32) if DEMO else None),
+            "anthropic_api": bool(active.get("anthropic_api")),
+        }
+
+    def credentials(self, request_host: str | None = None) -> dict:
+        host = self.public_host(request_host)
+        hp = f"[{host}]" if ":" in host else host
         ng = self.cfg.get("nginx_port", 11443)
         if DEMO:
             return {
                 "openclaw": {"token": None, "password": None, "auth_mode": None,
-                             "dashboard_url": f"https://{host}:{ng}/"},
-                "api": {"key": self.key, "base_url": f"https://{host}:{ng}/v1",
-                        "model": "qwen3.8-27b-sglang", "found_in": [], "other_keys": {},
-                        "openclaw_provider_keys": []},
+                             "dashboard_url": f"https://{hp}:{ng}/"},
+                "api": {"key": self.key, "base_url": f"https://{hp}:{ng}/v1",
+                        "model": self.status()["models"].get(self.status()["active"] or "", {}).get("served_id"),
+                        "found_in": [], "other_keys": {}, "openclaw_provider_keys": []},
                 "demo": True,
             }
         oc = self.openclaw_config()
@@ -704,19 +1329,18 @@ class Engine:
         provider_keys = {name: p.get("apiKey") for name, p in
                          ((oc.get("models") or {}).get("providers") or {}).items() if p.get("apiKey")}
         api_key = self.key
-        host = self.cfg.get("public_host") or "127.0.0.1"
-        ng = self.cfg.get("nginx_port", 11443)
+        st = self.status()
         return {
             "openclaw": {
                 "token": token,
                 "password": password,
                 "auth_mode": auth.get("mode"),
-                "dashboard_url": f"https://{host}:{ng}/" + (f"#token={token}" if token else ""),
+                "dashboard_url": f"https://{hp}:{ng}/" + (f"#token={token}" if token else ""),
             },
             "api": {
                 "key": api_key,
-                "base_url": f"https://{host}:{ng}/v1",
-                "model": self.status()["models"].get(self.status()["active"] or "", {}).get("served_id"),
+                "base_url": f"https://{hp}:{ng}/v1",
+                "model": st["models"].get(st["active"] or "", {}).get("served_id"),
                 "found_in": sorted(set(found_keys.get(api_key, []))),
                 "other_keys": {k: sorted(set(v)) for k, v in found_keys.items() if k != api_key},
                 "openclaw_provider_keys": sorted({k for k in provider_keys.values()}),

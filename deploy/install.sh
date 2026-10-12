@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
-# Install / update Spark Swapper on the DGX Spark.   sudo bash install.sh
+# Install / update Spark Swapper on a DGX Spark or an AMD Strix Halo box.   sudo bash install.sh
 #
-# Copies the app to /opt/spark-swapper, renders the public models.json
+# Copies the app to /opt/spark-swapper, renders the public models.json site
 # template into /etc/spark-swapper/models.json with real values (user, host IP,
 # openclaw path), generates a self-signed cert, and runs the systemd service.
-# An existing /etc/spark-swapper/models.json is preserved (override wins).
+# An existing /etc/spark-swapper/models.json is preserved (override wins); the
+# model catalog (catalog.json) ships with the app, so updates bring new models.
+#
+# SWAPPER_AUTO_UPDATE=0 turns off automatic updates (the weekly check still shows
+# when a new version is out); =1 turns them back on. Unset leaves the setting alone.
 set -euo pipefail
 [[ $EUID -eq 0 ]] || { echo "Run with sudo:  sudo bash $0" >&2; exit 1; }
 SRC="$(cd "$(dirname "$0")/.." && pwd)"
@@ -33,19 +37,42 @@ for p in "/home/$USER_/.npm-global/bin/openclaw" "/usr/local/bin/openclaw" "/usr
 done
 OC_BIN="${OC_BIN:-/home/$USER_/.npm-global/bin/openclaw}"
 
-echo "==> installing app to $APP"
+python3 - <<'PY' || { echo "Spark Swapper needs Python 3.10 or newer." >&2; exit 1; }
+import sys
+sys.exit(0 if sys.version_info >= (3, 10) else 1)
+PY
+
+echo "==> installing app $(cat "$SRC/swapper/VERSION" 2>/dev/null || echo '?') to $APP"
 install -d -m 0755 "$APP" "$APP/web"
 install -m 0644 "$SRC"/swapper/*.py "$APP/"
-install -m 0644 "$SRC"/swapper/models.json "$APP/"
+install -m 0644 "$SRC"/swapper/models.json "$SRC"/swapper/catalog.json "$SRC"/swapper/VERSION "$APP/"
 install -m 0644 "$SRC"/swapper/web/* "$APP/web/"
 install -d -m 0700 "$CONF" "$STATE"
+
+# ── automatic updates (opt out with SWAPPER_AUTO_UPDATE=0) ──
+if [[ -n "${SWAPPER_AUTO_UPDATE:-}" ]]; then
+  python3 - "$STATE/state.json" "$SWAPPER_AUTO_UPDATE" <<'PY'
+import json, sys
+path, on = sys.argv[1], sys.argv[2] not in ("0", "false", "no", "off")
+try:
+    st = json.load(open(path))
+except (OSError, ValueError):
+    st = {}
+st.setdefault("updates", {})["auto_install"] = on
+json.dump(st, open(path, "w"), indent=2)
+PY
+  echo "==> automatic updates: $([[ "$SWAPPER_AUTO_UPDATE" =~ ^(0|false|no|off)$ ]] && echo off || echo on)"
+fi
 
 # ── render the template (only if the box doesn't already have a config) ──
 if [[ ! -s "$CONF/models.json" ]]; then
   echo "==> rendering config: user=$USER_ host=$IP openclaw=$OC_BIN"
+  # A fresh box gets its own API key instead of the well-known "vllm-local".
+  KEY="sk-spark-$(openssl rand -hex 20)"
   sed -e "s/{{USER}}/$USER_/g" \
       -e "s/{{PUBLIC_HOST}}/$IP/g" \
       -e "s/{{OPENCLAW_BIN}}/$OC_BIN/g" \
+      -e "s/\"api_key\": \"vllm-local\"/\"api_key\": \"$KEY\"/" \
       "$APP/models.json" > "$CONF/models.json"
   chmod 640 "$CONF/models.json"
 else
@@ -63,12 +90,20 @@ if [[ ! -s "$CONF/tls.crt" ]]; then
   chmod 600 "$CONF/tls.key"
 fi
 
+# ── HTTPS front helper (also used by DSH's Spark guide) ──
+cat > /usr/local/sbin/spark-swapper-front <<'FRONT'
+#!/usr/bin/env bash
+# Set up nginx on :11443 for the model API, requiring the API key (Provisioning ▸ HTTPS front).
+exec /usr/bin/python3 /opt/spark-swapper/app.py --setup-front "$@"
+FRONT
+chmod 755 /usr/local/sbin/spark-swapper-front
+
 # ── reset-login helper ──
 cat > /usr/local/sbin/spark-swapper-reset-login <<'RESET'
 #!/usr/bin/env bash
 # Forget all web logins so the next visitor to https://<spark>:8999 creates a new admin.
 set -e
-rm -f /etc/spark-swapper/users.json /etc/spark-swapper/secret.key
+rm -f /etc/spark-swapper/users.json /etc/spark-swapper/secret.key /etc/spark-swapper/tokens.json
 systemctl restart spark-swapper
 echo "Logins cleared. Visit the page to create the admin login."
 RESET
@@ -84,7 +119,15 @@ if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q "Status: active
   ufw allow "$PORT/tcp" >/dev/null && echo "==> ufw: allowed $PORT/tcp"
 fi
 
-for _ in $(seq 1 20); do
+# An HTTPS front written before 2.0 (by DSH's Spark guide) doesn't check the API key, which
+# 2.0's TensorFold and Nemotron models need: replace it with Spark Swapper's own.
+FRONT_CONF=/etc/nginx/conf.d/spark-model-front.conf
+if [[ -f "$FRONT_CONF" ]] && grep -q "Written by DSH for Windows" "$FRONT_CONF"; then
+  echo "==> upgrading the :11443 HTTPS front so it requires the API key"
+  /usr/local/sbin/spark-swapper-front || echo "   (couldn't — run Provisioning ▸ HTTPS front on the page)"
+fi
+
+for _ in $(seq 1 120); do
   curl -ksf "https://127.0.0.1:$PORT/api/session" >/dev/null && break; sleep 0.5
 done
 if curl -ksf "https://127.0.0.1:$PORT/api/session" >/dev/null; then
@@ -93,6 +136,7 @@ if curl -ksf "https://127.0.0.1:$PORT/api/session" >/dev/null; then
   echo "  (self-signed certificate: accept the browser warning once,"
   echo "   or trust the cert — see the Provisioning tab in the UI)"
   echo "  First visit: create the admin login.  Forgot it?  sudo spark-swapper-reset-login"
+  echo "  Updates install themselves on Sundays (turn that off on the Settings tab)."
 else
   echo "Service did not answer; see: journalctl -u spark-swapper -n 50" >&2
   exit 1

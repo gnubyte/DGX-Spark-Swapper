@@ -10,6 +10,8 @@ __pycache__/
 *.tar
 auth.json
 users.json
+tokens.json
+update-result.json
 secret.key
 tls.crt
 tls.key
