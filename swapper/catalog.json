@@ -1,0 +1,401 @@
+{
+  "_comment": "The model catalog shipped with each Spark Swapper release. Every entry names the platforms it runs on, how to install it, how to start/stop it and the speeds its recipe publishes. {{USER}} and {{HOME}} are filled in from the site config (/etc/spark-swapper/models.json, openclaw.user / openclaw.home). A model with the same key in the site config is merged over the catalog entry field by field (the site wins); list a key in the site config's \"hidden_models\" to hide it. Speeds are tokens per second: decode = one request on its own, decode_concurrent = the total across `concurrency` requests.",
+
+  "catalog_version": 2,
+
+  "models": {
+    "tf27b": {
+      "order": 1,
+      "platforms": ["nvidia-gb10"],
+      "family": "qwen3.8-27b",
+      "title": "Qwen3.8 27B",
+      "tagline": "The all-rounder: fast decode with DFlash2 drafts, images and video, eight requests at once.",
+      "engine": "TensorFold v0.6.0 · MLX 4-bit · DFlash2",
+      "recommended": true,
+      "kind": "recipe-script",
+      "dir": "{{HOME}}/Qwen3.8-27B-DGX-Spark-TensorFold",
+      "start": ["bash", "./start.sh"],
+      "stop": ["bash", "./stop.sh"],
+      "run_as": "user",
+      "env": { "HOST": "127.0.0.1", "WAIT_TIMEOUT": "2400" },
+      "container": "qwen38-27b-tf",
+      "served_id": "Qwen3.8-27B",
+      "context": 262144,
+      "vision": true,
+      "min_free_gib": 90,
+      "start_timeout_s": 2400,
+      "eta": "about a minute (the very first start compiles kernels: a few minutes)",
+      "openclaw_provider": "tf27b",
+      "openclaw_model_name": "Qwen3.8 27B (TensorFold, DFlash2, 262K ctx)",
+      "openclaw_context": 262144,
+      "perf": {
+        "decode": 58.3, "decode_concurrent": 220.6, "concurrency": 8, "prefill": 1793.0,
+        "code": 136.9, "source": "sparkDash (MiaAI-Lab), prose; code decodes at 136.9 tok/s", "estimate": false
+      },
+      "repo": "https://github.com/MiaAI-Lab/Qwen3.8-27B-DGX-Spark-TensorFold",
+      "install": {
+        "requires": ["git", "docker"],
+        "size_gb": 60,
+        "time": "15–30 minutes: pulls or builds the TensorFold image and downloads ~19 GB of weights",
+        "steps": [
+          { "do": "git", "url": "https://github.com/MiaAI-Lab/Qwen3.8-27B-DGX-Spark-TensorFold.git", "dir": "{{HOME}}/Qwen3.8-27B-DGX-Spark-TensorFold" },
+          { "do": "run", "cmd": ["bash", "scripts/prepare.sh"], "cwd": "{{HOME}}/Qwen3.8-27B-DGX-Spark-TensorFold", "as": "user", "timeout": 14400 }
+        ],
+        "ready": [
+          { "file": "{{HOME}}/Qwen3.8-27B-DGX-Spark-TensorFold/start.sh" },
+          { "file": "{{HOME}}/.cache/tensorfold-qwen38-27b/.prepared" }
+        ]
+      }
+    },
+
+    "tfflash": {
+      "order": 2,
+      "platforms": ["nvidia-gb10"],
+      "family": "qwen3.8-flash-next",
+      "title": "Qwen3.8 Flash Next",
+      "tagline": "The strongest model that fits one Spark: a 125B mixture of experts, with images and video.",
+      "engine": "TensorFold Zig engine · INT4-AutoRound · MTP",
+      "recommended": true,
+      "kind": "recipe-script",
+      "dir": "{{HOME}}/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold",
+      "start": ["bash", "./start.sh"],
+      "stop": ["bash", "./stop.sh"],
+      "run_as": "user",
+      "env": { "HOST": "127.0.0.1", "WAIT_TIMEOUT": "3000" },
+      "container": "qwen38-flash-next-tf",
+      "served_id": "Qwen3.8-Flash-Next",
+      "context": 262144,
+      "vision": true,
+      "anthropic_api": true,
+      "min_free_gib": 92,
+      "start_timeout_s": 3000,
+      "eta": "a few minutes (loads ~66 GiB of weights)",
+      "openclaw_provider": "tfflash",
+      "openclaw_model_name": "Qwen3.8 Flash Next (TensorFold, MTP, 262K ctx)",
+      "openclaw_context": 262144,
+      "perf": {
+        "decode": 64.4, "decode_concurrent": 200.9, "concurrency": 8, "prefill": 2606.0,
+        "code": 57.5, "source": "sparkDash (MiaAI-Lab), prose, FP8 KV with vision on", "estimate": false
+      },
+      "repo": "https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold",
+      "install": {
+        "requires": ["git", "docker"],
+        "size_gb": 165,
+        "time": "1–2 hours: builds the engine image and downloads the ~122 GiB checkpoint",
+        "steps": [
+          { "do": "git", "url": "https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold.git", "dir": "{{HOME}}/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold" },
+          { "do": "run", "cmd": ["bash", "scripts/prepare.sh"], "cwd": "{{HOME}}/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold", "as": "user", "timeout": 21600 }
+        ],
+        "ready": [
+          { "file": "{{HOME}}/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold/start.sh" },
+          { "file": "{{HOME}}/.local/state/qwen38-flash-next-tf/prepared" }
+        ]
+      }
+    },
+
+    "nemotron": {
+      "order": 3,
+      "platforms": ["nvidia-gb10"],
+      "family": "nemotron-3.5-lightning",
+      "title": "Nemotron 3.5 Lightning",
+      "tagline": "NVIDIA's quick reasoner: 30B MoE (3B active), 1M context, dozens of requests at once.",
+      "engine": "SGLang · NVFP4 · DSpark drafts",
+      "kind": "recipe-script",
+      "dir": "{{HOME}}/Nemotron3.5-Lightning-DGX-Spark-RTX-5090-6000-PRO",
+      "start": ["bash", "./start.sh"],
+      "stop": ["bash", "./stop.sh"],
+      "run_as": "user",
+      "env": { "HOST": "127.0.0.1" },
+      "container": "nemotron-3.5-lightning-dspark",
+      "served_id": "nemotron-3.5-lightning",
+      "served_match": "Nemotron-3.5-Lightning",
+      "context": 1048576,
+      "vision": false,
+      "min_free_gib": 100,
+      "start_timeout_s": 2400,
+      "eta": "a few minutes (it checks for a newer image first)",
+      "openclaw_provider": "nemotron",
+      "openclaw_model_name": "Nemotron 3.5 Lightning 30B-A3B (SGLang, DSpark, 1M ctx)",
+      "openclaw_context": 1048576,
+      "perf": {
+        "decode": 124.2, "decode_concurrent": 354.6, "concurrency": 8,
+        "source": "community measurement of the same model and DSpark drafter on a DGX Spark (vLLM, code; Classmethod) — this recipe serves it with SGLang", "estimate": true
+      },
+      "repo": "https://github.com/MiaAI-Lab/Nemotron3.5-Lightning-DGX-Spark-RTX-5090-6000-PRO",
+      "install": {
+        "requires": ["git", "docker"],
+        "size_gb": 50,
+        "time": "10–20 minutes: downloads ~21 GB of weights and the SGLang image",
+        "steps": [
+          { "do": "git", "url": "https://github.com/MiaAI-Lab/Nemotron3.5-Lightning-DGX-Spark-RTX-5090-6000-PRO.git", "dir": "{{HOME}}/Nemotron3.5-Lightning-DGX-Spark-RTX-5090-6000-PRO" },
+          { "do": "run", "cmd": ["bash", "./start.sh", "--download-only"], "cwd": "{{HOME}}/Nemotron3.5-Lightning-DGX-Spark-RTX-5090-6000-PRO", "as": "user", "timeout": 10800, "env": { "PORT": "18888" }, "note": "start.sh refuses to run while its port is busy, even with --download-only, and the model serving now holds 8888" },
+          { "do": "docker_pull", "image": "lmsysorg/sglang:dev-nemotron3-5-lightning", "as": "user", "timeout": 7200 }
+        ],
+        "ready": [
+          { "file": "{{HOME}}/Nemotron3.5-Lightning-DGX-Spark-RTX-5090-6000-PRO/start.sh" },
+          { "hf_cached": "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4", "home": "{{HOME}}" },
+          { "hf_cached": "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DSpark", "home": "{{HOME}}" }
+        ]
+      }
+    },
+
+    "standard": {
+      "order": 4,
+      "platforms": ["nvidia-gb10"],
+      "family": "qwen3.8-27b",
+      "title": "Qwen3.8 27B (SGLang)",
+      "tagline": "The dependable one: biggest context (1M with YaRN), steady tool use.",
+      "engine": "SGLang · NVFP4 · EAGLE speculative decoding",
+      "kind": "sglang-docker",
+      "container": "qwen3.8-27b-sglang",
+      "served_id": "qwen3.8-27b-sglang",
+      "context": 1000000,
+      "vision": true,
+      "min_free_gib": 100,
+      "start_timeout_s": 1500,
+      "eta": "3–6 minutes",
+      "openclaw_provider": "sglang",
+      "openclaw_model_name": "Qwen3.8 27B NVFP4 (SGLang, EAGLE/MTP, 1M ctx, YaRN)",
+      "openclaw_context": 800000,
+      "perf": {
+        "decode": 24.2, "source": "the recipe's own benchmark (EAGLE/MTP, code probe; ~18 tok/s on long prose)", "estimate": false
+      },
+      "repo": "https://github.com/MiaAI-Lab/Qwen3.8-27B-SGLang-DGX-Spark",
+      "install": {
+        "requires": ["docker"],
+        "size_gb": 40,
+        "time": "10–20 minutes: pulls the SGLang image and downloads ~20 GB of weights",
+        "steps": [
+          { "do": "docker_pull", "image": "lmsysorg/sglang:qwen38-27b", "timeout": 7200 },
+          { "do": "hf_docker", "image": "lmsysorg/sglang:qwen38-27b", "repo": "RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead", "cache": "{{HOME}}/sglang-spark/.cache/huggingface", "timeout": 10800 }
+        ],
+        "ready": [
+          { "docker_image_or_container": "lmsysorg/sglang:qwen38-27b", "container": "qwen3.8-27b-sglang" }
+        ]
+      },
+      "docker_run": [
+        "--network", "host", "--ipc", "host", "--shm-size", "32g", "--gpus", "all",
+        "--restart", "unless-stopped",
+        "-v", "{{HOME}}/sglang-spark/.cache/huggingface:/root/.cache/huggingface",
+        "-v", "{{HOME}}/sglang-spark/.cache/triton:/root/.triton",
+        "lmsysorg/sglang:qwen38-27b",
+        "python3", "-m", "sglang.launch_server",
+        "--model-path", "RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead",
+        "--served-model-name", "qwen3.8-27b-sglang",
+        "--trust-remote-code",
+        "--mem-fraction-static", "0.80",
+        "--attention-backend", "flashinfer",
+        "--chunked-prefill-size", "8192",
+        "--disable-prefill-cuda-graph",
+        "--kv-cache-dtype", "fp8_e4m3",
+        "--mamba-ssm-dtype", "bfloat16",
+        "--mamba-full-memory-ratio", "4.21",
+        "--mamba-radix-cache-strategy", "extra_buffer_lazy",
+        "--max-mamba-cache-size", "64",
+        "--max-running-requests", "16",
+        "--json-model-override-args", "{\"text_config\": {\"rope_parameters\": {\"mrope_interleaved\": true, \"mrope_section\": [11, 11, 10], \"rope_type\": \"yarn\", \"rope_theta\": 10000000, \"partial_rotary_factor\": 0.25, \"factor\": 4, \"original_max_position_embeddings\": 262144}}}",
+        "--context-length", "1000000",
+        "--speculative-algorithm", "EAGLE",
+        "--speculative-num-steps", "3",
+        "--speculative-eagle-topk", "1",
+        "--speculative-num-draft-tokens", "4",
+        "--reasoning-parser", "qwen3",
+        "--tool-call-parser", "qwen3_coder",
+        "--sampling-defaults", "model",
+        "--enable-metrics", "--enable-cache-report",
+        "--host", "127.0.0.1", "--port", "8888", "--api-key", "vllm-local"
+      ]
+    },
+
+    "flash": {
+      "order": 5,
+      "platforms": ["nvidia-gb10"],
+      "family": "qwen3.8-flash-next",
+      "title": "Qwen3.8 Flash Next (vLLM)",
+      "tagline": "The original Flash Next recipe, with a longer window. Its authors now recommend the TensorFold version above.",
+      "engine": "vLLM · NVFP4 · MTP-3 · PLE offload",
+      "superseded_by": "tfflash",
+      "kind": "flash-vllm",
+      "container": "vllm-fn-tp1",
+      "served_id": "qwen3.8-flash-next",
+      "dir": "{{HOME}}/Qwen3.8-Flash-Next-Single-DGX-Spark",
+      "checkpoint": "models--Mia-AiLab--Qwen3.8-Flash-Next-NVFP4",
+      "env": { "YARN": "1", "YARN_MAX_MODEL_LEN": "524288" },
+      "context": 524288,
+      "vision": true,
+      "min_free_gib": 100,
+      "start_timeout_s": 2100,
+      "eta": "about 11 minutes",
+      "openclaw_provider": "flash",
+      "openclaw_model_name": "Qwen3.8 Flash Next (vLLM, MTP, 512K ctx)",
+      "openclaw_context": 524288,
+      "perf": {
+        "decode": 48.7, "decode_concurrent": 162.9, "concurrency": 8, "prefill": 2200.0,
+        "source": "sparkDash sweep in the recipe's README (prose)", "estimate": false
+      },
+      "repo": "https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark",
+      "install": {
+        "requires": ["git", "docker"],
+        "size_gb": 130,
+        "time": "1–2 hours: downloads the ~99 GiB checkpoint; the first start builds a ~27 GiB table",
+        "steps": [
+          { "do": "git", "url": "https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark.git", "dir": "{{HOME}}/Qwen3.8-Flash-Next-Single-DGX-Spark" },
+          { "do": "env_file", "dir": "{{HOME}}/Qwen3.8-Flash-Next-Single-DGX-Spark" },
+          { "do": "run", "cmd": ["bash", "./download.sh"], "cwd": "{{HOME}}/Qwen3.8-Flash-Next-Single-DGX-Spark", "as": "root", "env": { "HOME": "/root" }, "timeout": 21600 }
+        ],
+        "ready": [
+          { "file": "{{HOME}}/Qwen3.8-Flash-Next-Single-DGX-Spark/start.sh" },
+          { "file": "{{HOME}}/Qwen3.8-Flash-Next-Single-DGX-Spark/.env" }
+        ]
+      }
+    },
+
+    "halo27b": {
+      "order": 1,
+      "platforms": ["amd-strix-halo"],
+      "family": "qwen3.8-27b",
+      "title": "Qwen3.8 27B",
+      "tagline": "The quick one on Strix Halo: 4-bit, with the model's own MTP drafts.",
+      "engine": "llama.cpp · Vulkan · Q4_K_M · MTP drafts",
+      "recommended": true,
+      "kind": "llamacpp",
+      "unit": "swapper-llama-halo27b",
+      "served_id": "qwen3.8-27b",
+      "model_file": "lmstudio-community/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_K_M.gguf",
+      "files": [
+        { "repo": "lmstudio-community/Qwen3.8-27B-GGUF", "path": "Qwen3.8-27B-Q4_K_M.gguf" }
+      ],
+      "args": [
+        "--ctx-size", "131072", "--n-gpu-layers", "999", "--parallel", "1", "--threads", "12",
+        "--batch-size", "512", "--ubatch-size", "512", "--flash-attn", "on",
+        "--cache-type-k", "f16", "--cache-type-v", "f16", "--kv-unified", "--no-mmap", "--jinja",
+        "--reasoning", "off"
+      ],
+      "spec_args": ["--spec-type", "draft-mtp", "--spec-draft-n-max", "4", "--spec-draft-p-min", "0.2"],
+      "context": 131072,
+      "vision": false,
+      "min_free_gib": 30,
+      "gpu_gib": 26,
+      "start_timeout_s": 600,
+      "eta": "about 20 seconds",
+      "openclaw_provider": "halo27b",
+      "openclaw_model_name": "Qwen3.8 27B Q4_K_M (llama.cpp Vulkan, MTP, 128K ctx)",
+      "openclaw_context": 131072,
+      "perf": {
+        "decode": 26.5, "source": "yandaq/qwen3.8-27b-strix-halo (Ryzen AI Max+ 395, thinking off; prose 23.1, code 29.5)", "estimate": false
+      },
+      "repo": "https://github.com/yandaq/qwen3.8-27b-strix-halo",
+      "install": {
+        "requires": ["vulkan", "llamacpp"],
+        "size_gb": 18,
+        "time": "5–15 minutes: downloads 16.8 GB",
+        "steps": [ { "do": "hf_files" } ],
+        "ready": [ { "hf_files": true } ]
+      }
+    },
+
+    "halo27b-q8": {
+      "order": 2,
+      "platforms": ["amd-strix-halo"],
+      "family": "qwen3.8-27b",
+      "title": "Qwen3.8 27B (8-bit)",
+      "tagline": "Closer to the full model, at about half the speed of the 4-bit.",
+      "engine": "llama.cpp · Vulkan · UD-Q8_K_XL · MTP drafts",
+      "kind": "llamacpp",
+      "unit": "swapper-llama-halo27b-q8",
+      "served_id": "qwen3.8-27b-8bit",
+      "model_file": "unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q8_K_XL.gguf",
+      "files": [
+        { "repo": "unsloth/Qwen3.8-27B-GGUF", "path": "Qwen3.8-27B-UD-Q8_K_XL.gguf" }
+      ],
+      "args": [
+        "--ctx-size", "131072", "--n-gpu-layers", "999", "--parallel", "1", "--threads", "12",
+        "--batch-size", "512", "--ubatch-size", "512", "--flash-attn", "on",
+        "--cache-type-k", "f16", "--cache-type-v", "f16", "--kv-unified", "--no-mmap", "--jinja",
+        "--reasoning", "off"
+      ],
+      "spec_args": ["--spec-type", "draft-mtp", "--spec-draft-n-max", "4", "--spec-draft-p-min", "0.2"],
+      "context": 131072,
+      "vision": false,
+      "min_free_gib": 45,
+      "gpu_gib": 41,
+      "start_timeout_s": 600,
+      "eta": "about 20 seconds",
+      "openclaw_provider": "halo27b8",
+      "openclaw_model_name": "Qwen3.8 27B UD-Q8_K_XL (llama.cpp Vulkan, MTP, 128K ctx)",
+      "openclaw_context": 131072,
+      "perf": {
+        "decode": 15.2, "source": "yandaq/qwen3.8-27b-strix-halo (Ryzen AI Max+ 395, thinking off; prose 13.2, code 17.1)", "estimate": false
+      },
+      "repo": "https://github.com/yandaq/qwen3.8-27b-strix-halo",
+      "install": {
+        "requires": ["vulkan", "llamacpp"],
+        "size_gb": 33,
+        "time": "10–25 minutes: downloads 31.5 GB",
+        "steps": [ { "do": "hf_files" } ],
+        "ready": [ { "hf_files": true } ]
+      }
+    },
+
+    "haloflash": {
+      "order": 3,
+      "platforms": ["amd-strix-halo"],
+      "family": "qwen3.8-flash-next",
+      "title": "Qwen3.8 Flash Next",
+      "tagline": "The 125B MoE squeezed into 128 GB: 3-bit dynamic quant with MTP drafts. Needs the GPU memory limit raised.",
+      "engine": "llama.cpp (Unsloth build) · Vulkan · UD-Q3_K_XL · MTP drafts",
+      "kind": "llamacpp",
+      "unit": "swapper-llama-haloflash",
+      "served_id": "qwen3.8-flash-next",
+      "model_file": "unsloth/Qwen3.8-Flash-Next-GGUF/UD-Q3_K_XL/Qwen3.8-Flash-Next-UD-Q3_K_XL-00001-of-00003.gguf",
+      "draft_file": "unsloth/Qwen3.8-Flash-Next-GGUF/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf",
+      "files": [
+        { "repo": "unsloth/Qwen3.8-Flash-Next-GGUF", "path": "UD-Q3_K_XL/Qwen3.8-Flash-Next-UD-Q3_K_XL-00001-of-00003.gguf" },
+        { "repo": "unsloth/Qwen3.8-Flash-Next-GGUF", "path": "UD-Q3_K_XL/Qwen3.8-Flash-Next-UD-Q3_K_XL-00002-of-00003.gguf" },
+        { "repo": "unsloth/Qwen3.8-Flash-Next-GGUF", "path": "UD-Q3_K_XL/Qwen3.8-Flash-Next-UD-Q3_K_XL-00003-of-00003.gguf" },
+        { "repo": "unsloth/Qwen3.8-Flash-Next-GGUF", "path": "MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf" }
+      ],
+      "args": [
+        "--ctx-size", "131072", "--n-gpu-layers", "999", "--parallel", "1", "--threads", "12",
+        "--batch-size", "512", "--ubatch-size", "512", "--flash-attn", "on",
+        "--kv-unified", "--no-mmap", "--jinja",
+        "--reasoning", "off"
+      ],
+      "spec_args": ["--spec-type", "draft-mtp", "--spec-draft-n-max", "2"],
+      "context": 131072,
+      "vision": false,
+      "min_free_gib": 100,
+      "gpu_gib": 96,
+      "start_timeout_s": 900,
+      "eta": "about a minute",
+      "openclaw_provider": "haloflash",
+      "openclaw_model_name": "Qwen3.8 Flash Next UD-Q3_K_XL (llama.cpp Vulkan, MTP, 128K ctx)",
+      "openclaw_context": 131072,
+      "perf": {
+        "decode": 40, "range": "30–50", "source": "estimate from the box's memory bandwidth (6B active parameters at ~3.5 bits); no published Strix Halo measurement yet — the Swapper measures it after the first load", "estimate": true
+      },
+      "repo": "https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF",
+      "install": {
+        "requires": ["vulkan", "llamacpp", "gpumem"],
+        "size_gb": 95,
+        "time": "45–90 minutes: downloads ~93 GB",
+        "steps": [ { "do": "hf_files" } ],
+        "ready": [ { "hf_files": true } ]
+      }
+    }
+  },
+
+  "recipes": {
+    "sglang_recipe": {
+      "repo": "MiaAI-Lab/Qwen3.8-27B-SGLang-DGX-Spark",
+      "url": "https://github.com/MiaAI-Lab/Qwen3.8-27B-SGLang-DGX-Spark.git",
+      "dir": "{{HOME}}/Qwen3.8-27B-SGLang-DGX-Spark"
+    },
+    "flash_recipe": {
+      "repo": "MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark",
+      "url": "https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark.git",
+      "dir": "{{HOME}}/Qwen3.8-Flash-Next-Single-DGX-Spark",
+      "checkpoint": "models--Mia-AiLab--Qwen3.8-Flash-Next-NVFP4"
+    }
+  }
+}

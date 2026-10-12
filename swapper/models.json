@@ -1,11 +1,13 @@
 {
-  "_comment": "Public template. {{USER}}, {{PUBLIC_HOST}} and {{OPENCLAW_BIN}} are substituted by the installer (deploy/install.sh) with the real values at install time. To override on a box, copy this file to /etc/spark-swapper/models.json and edit.",
+  "_comment": "Site config template. deploy/install.sh renders it once into /etc/spark-swapper/models.json ({{USER}}, {{PUBLIC_HOST}} and {{OPENCLAW_BIN}} become real values) and never overwrites it afterwards. The models themselves come from catalog.json, which ships with every release, so updates bring new models. To change a model on this box, add an entry with the same key under \"models\" here: its fields are merged over the catalog's (this file wins). \"hidden_models\" hides catalog models; \"platform\" forces nvidia-gb10 or amd-strix-halo instead of detecting it.",
 
   "api_port": 8888,
   "api_key": "vllm-local",
   "nginx_port": 11443,
   "public_host": "{{PUBLIC_HOST}}",
   "boot_autostart": true,
+  "platform": "auto",
+  "hidden_models": [],
 
   "openclaw": {
     "user": "{{USER}}",
@@ -24,88 +26,5 @@
     "/home/{{USER}}/cline_connect_instructions.sh"
   ],
 
-  "recipes": {
-    "sglang_recipe": {
-      "repo": "MiaAI-Lab/Qwen3.8-27B-SGLang-DGX-Spark",
-      "url": "https://github.com/MiaAI-Lab/Qwen3.8-27B-SGLang-DGX-Spark.git",
-      "dir": "/home/{{USER}}/Qwen3.8-27B-SGLang-DGX-Spark"
-    },
-    "flash_recipe": {
-      "repo": "MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark",
-      "url": "https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark.git",
-      "dir": "/home/{{USER}}/Qwen3.8-Flash-Next-Single-DGX-Spark",
-      "checkpoint": "models--Mia-AiLab--Qwen3.8-Flash-Next-NVFP4"
-    }
-  },
-
-  "models": {
-    "standard": {
-      "order": 1,
-      "title": "Qwen3.8 27B",
-      "tagline": "The dependable one: biggest context, steady tool use.",
-      "engine": "SGLang · NVFP4 · EAGLE speculative decoding",
-      "kind": "sglang-docker",
-      "container": "qwen3.8-27b-sglang",
-      "served_id": "qwen3.8-27b-sglang",
-      "context": 1000000,
-      "vision": true,
-      "min_free_gib": 100,
-      "start_timeout_s": 1500,
-      "openclaw_provider": "sglang",
-      "openclaw_model_name": "Qwen3.8 27B NVFP4 (SGLang, EAGLE/MTP, 1M ctx, YaRN)",
-      "openclaw_context": 800000,
-      "docker_run": [
-        "--network", "host", "--ipc", "host", "--shm-size", "32g", "--gpus", "all",
-        "--restart", "unless-stopped",
-        "-v", "/home/{{USER}}/sglang-spark/.cache/huggingface:/root/.cache/huggingface",
-        "-v", "/home/{{USER}}/sglang-spark/.cache/triton:/root/.triton",
-        "lmsysorg/sglang:qwen38-27b",
-        "python3", "-m", "sglang.launch_server",
-        "--model-path", "RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead",
-        "--served-model-name", "qwen3.8-27b-sglang",
-        "--trust-remote-code",
-        "--mem-fraction-static", "0.80",
-        "--attention-backend", "flashinfer",
-        "--chunked-prefill-size", "8192",
-        "--disable-prefill-cuda-graph",
-        "--kv-cache-dtype", "fp8_e4m3",
-        "--mamba-ssm-dtype", "bfloat16",
-        "--mamba-full-memory-ratio", "4.21",
-        "--mamba-radix-cache-strategy", "extra_buffer_lazy",
-        "--max-mamba-cache-size", "64",
-        "--max-running-requests", "16",
-        "--json-model-override-args", "{\"text_config\": {\"rope_parameters\": {\"mrope_interleaved\": true, \"mrope_section\": [11, 11, 10], \"rope_type\": \"yarn\", \"rope_theta\": 10000000, \"partial_rotary_factor\": 0.25, \"factor\": 4, \"original_max_position_embeddings\": 262144}}}",
-        "--context-length", "1000000",
-        "--speculative-algorithm", "EAGLE",
-        "--speculative-num-steps", "3",
-        "--speculative-eagle-topk", "1",
-        "--speculative-num-draft-tokens", "4",
-        "--reasoning-parser", "qwen3",
-        "--tool-call-parser", "qwen3_coder",
-        "--sampling-defaults", "model",
-        "--enable-metrics", "--enable-cache-report",
-        "--host", "127.0.0.1", "--port", "8888", "--api-key", "vllm-local"
-      ]
-    },
-
-    "flash": {
-      "order": 2,
-      "title": "Qwen3.8 Flash Next",
-      "tagline": "The quick one: faster decode, vision and video, 512K context.",
-      "engine": "vLLM · NVFP4 · MTP-3 · PLE offload",
-      "kind": "flash-vllm",
-      "container": "vllm-fn-tp1",
-      "served_id": "qwen3.8-flash-next",
-      "dir": "/home/{{USER}}/Qwen3.8-Flash-Next-Single-DGX-Spark",
-      "checkpoint": "models--Mia-AiLab--Qwen3.8-Flash-Next-NVFP4",
-      "env": { "YARN": "1", "YARN_MAX_MODEL_LEN": "524288" },
-      "context": 524288,
-      "vision": true,
-      "min_free_gib": 100,
-      "start_timeout_s": 2100,
-      "openclaw_provider": "flash",
-      "openclaw_model_name": "Qwen3.8 Flash Next (vLLM, MTP, 512K ctx)",
-      "openclaw_context": 524288
-    }
-  }
+  "models": {}
 }

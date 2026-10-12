@@ -25,8 +25,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import engine  # noqa: E402
-from engine import Engine  # noqa: E402
+import hardware  # noqa: E402
+import tokens as tokens_mod  # noqa: E402
+from engine import Engine, NotInstalled  # noqa: E402
 from installer import Installer  # noqa: E402
+from updater import Updater  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent
 WEB = ROOT / "web"
@@ -39,6 +42,8 @@ SESSION_DAYS = 30
 
 CERT = CONF_DIR / "tls.crt"
 KEY = CONF_DIR / "tls.key"
+
+VERSION = engine.app_version()
 
 # In-memory (demo) or on-disk auth database: {username: {salt, hash, role, created}}
 _users: dict[str, dict] | None = None
@@ -57,6 +62,10 @@ def _secret() -> bytes:
 
 SECRET_FILE = CONF_DIR / "secret.key"
 AUTH_FILE = CONF_DIR / "users.json"
+TOKENS = tokens_mod.TokenStore(CONF_DIR / "tokens.json", persist=not DEMO)
+
+# Routes an app token may not use: it acts as its user for everything else.
+TOKEN_FORBIDDEN = ("/api/users", "/api/tokens", "/api/updates", "/api/password", "/api/setup")
 
 
 def _hash(password: str, salt: bytes) -> str:
@@ -120,6 +129,7 @@ def remove_user(username: str) -> None:
     with _users_lock:
         _load_users().pop(username, None)
         _save_users()
+    TOKENS.revoke_user(username)
 
 
 def set_password(username: str, password: str) -> None:
@@ -215,11 +225,12 @@ setup_lock = threading.Lock()
 # ─────────────────────────────── http ────────────────────────────────
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "SparkSwapper/1.1"
+    server_version = f"SparkSwapper/{VERSION}"
     timeout = 30
     sys_version = ""
     engine: Engine
     installer: Installer
+    updater: Updater
 
     def log_message(self, fmt, *args):  # quieter journal
         if not self.path.startswith("/api/status"):
@@ -254,8 +265,31 @@ class Handler(BaseHTTPRequestHandler):
                 return v
         return None
 
+    def _bearer(self) -> str | None:
+        auth = self.headers.get("Authorization") or ""
+        if auth[:7].lower() == "bearer ":
+            return auth[7:].strip()
+        return None
+
     def _user(self) -> dict | None:
-        return read_session(self._cookie())
+        """{username, role, via} from the session cookie or an app token."""
+        token = self._bearer()
+        if token:
+            t = TOKENS.verify(token)
+            if not t:
+                return None
+            u = get_user(t["user"])
+            if not u:
+                return None
+            return {"username": t["user"], "role": u.get("role", "user"), "via": "token", "token_id": t["id"]}
+        s = read_session(self._cookie())
+        return {**s, "via": "cookie"} if s else None
+
+    def _token_blocked(self, user: dict, path: str) -> bool:
+        return user.get("via") == "token" and path.startswith(TOKEN_FORBIDDEN)
+
+    def _host(self) -> str | None:
+        return self.headers.get("Host")
 
     def _body(self) -> dict:
         n = int(self.headers.get("Content-Length") or 0)
@@ -308,26 +342,73 @@ class Handler(BaseHTTPRequestHandler):
                 "setup_needed": not any_user(),
                 "user": u["username"] if u else None,
                 "role": u["role"] if u else None,
+                "via": u["via"] if u else None,
                 "demo": DEMO,
+                "version": VERSION,
+                "platform": self.engine.platform,
+                "platform_label": hardware.label(self.engine.platform),
+                "hostname": self.engine.hostname(),
             })
-        if not self._user():
+        user = self._user()
+        if not user:
+            if self._bearer():
+                return self._json(401, {"error": "This app connection is no longer valid (it was revoked, or the "
+                                                 "Swapper was reset). Create a new connection code."})
             return self._json(401, {"error": "Please sign in."})
+        if self._token_blocked(user, path):
+            return self._json(403, {"error": "Not available to app connections."})
+        is_admin = user["role"] == "admin"
         if path == "/api/status":
             st = self.engine.status()
             job = self.engine.job
-            return self._json(200, {**st, "job": job.to_dict() if job else None})
+            ijob = self.installer.job
+            upd = self.updater.info() if is_admin else None
+            return self._json(200, {
+                **st,
+                "job": job.to_dict() if job else None,
+                "install_job": ijob.to_dict() if ijob and (ijob.state == "running" or
+                                                            time.time() - (ijob.finished or 0) < 600) else None,
+                "update": {"available": upd["available"], "latest": upd["latest"],
+                           "auto_install": upd["auto_install"]} if upd else None,
+            })
         if path == "/api/credentials":
-            return self._json(200, self.engine.credentials())
+            return self._json(200, self.engine.credentials(self._host()))
+        if path == "/api/connect":
+            return self._json(200, self.engine.connect_info(CERT, PORT, self._host()))
+        if path == "/api/connect/test":
+            return self._json(200, self.engine_front_test())
         if path == "/api/provisioning":
             return self._json(200, self.installer.report())
         if path == "/api/provisioning/job":
             job = self.installer.job
             return self._json(200, {"job": job.to_dict() if job else None})
+        if path == "/api/tokens":
+            return self._json(200, {"tokens": TOKENS.list(None if is_admin else user["username"])})
+        if path == "/api/updates":
+            if not is_admin:
+                return self._json(403, {"error": "Admin only."})
+            return self._json(200, self.updater.info())
         if path == "/api/users":
-            if user_role(self._user()["username"]) == "admin":
+            if is_admin:
                 return self._json(200, {"users": list_users()})
             return self._json(403, {"error": "Admin only."})
         return self._json(404, {"error": "not found"})
+
+    def engine_front_test(self) -> dict:
+        """Ask the :11443 front for /v1/models with and without the key."""
+        ng = self.engine.cfg.get("nginx_port", 11443)
+        url = f"https://127.0.0.1:{ng}/v1/models"
+        if DEMO:
+            st = self.engine.status()
+            active = st["models"].get(st["active"] or "") or {}
+            return {"port": ng, "with_key": 200, "without_key": 401, "enforces_key": True,
+                    "models": [active["served_id"]] if active else []}
+        with_key = engine.http_status(url, self.engine.key)
+        without = engine.http_status(url, None)
+        listing = engine.http_json(url, self.engine.key, timeout=5) or {}
+        return {"port": ng, "with_key": with_key, "without_key": without,
+                "models": [m.get("id") for m in listing.get("data") or []],
+                "enforces_key": without == 401}
 
     def do_POST(self):
         path = self.path.split("?", 1)[0]
@@ -368,20 +449,24 @@ class Handler(BaseHTTPRequestHandler):
         user = self._user()
         if not user:
             return self._json(401, {"error": "Please sign in."})
+        if self._token_blocked(user, path):
+            return self._json(403, {"error": "Not available to app connections."})
         me, role = user["username"], user["role"]
 
         if path == "/api/swap":
             target = str(body.get("target", ""))
             try:
                 job = self.engine.begin_swap(target)
+            except NotInstalled as e:
+                return self._json(400, {"error": str(e), "not_installed": True})
             except ValueError:
                 return self._json(400, {"error": "Unknown model."})
             except RuntimeError as e:
                 return self._json(409, {"error": str(e)})
             return self._json(202, {"ok": True, "job": job.to_dict()})
 
-        if path == "/api/install":
-            action = str(body.get("action", ""))
+        if path in ("/api/install", "/api/models/install"):
+            action = str(body.get("action", "")) if path == "/api/install" else f"model:{body.get('key', '')}"
             if action not in self.installer.ACTIONS:
                 return self._json(400, {"error": "Unknown action."})
             try:
@@ -389,6 +474,18 @@ class Handler(BaseHTTPRequestHandler):
             except RuntimeError as e:
                 return self._json(409, {"error": str(e)})
             return self._json(202, {"ok": True, "job": job.to_dict()})
+
+        if path == "/api/tokens/create":
+            label = str(body.get("label", "") or "DSH").strip()[:80]
+            token, info = TOKENS.create(me, label)
+            connect = self.engine.connect_info(CERT, PORT, self._host())
+            return self._json(201, {"ok": True, "id": info["id"], "token": token, "label": info["label"],
+                                    "code": tokens_mod.connection_code(connect, token, me), "connect": connect})
+
+        if path == "/api/tokens/revoke":
+            tid = str(body.get("id", ""))
+            ok = TOKENS.revoke(tid, None if role == "admin" else me)
+            return self._json(200 if ok else 404, {"ok": ok} if ok else {"error": "No such connection."})
 
         if path == "/api/password":
             if not check_password(me, str(body.get("current", ""))):
@@ -402,6 +499,20 @@ class Handler(BaseHTTPRequestHandler):
         # ── admin-only ──
         if role != "admin":
             return self._json(403, {"error": "Admin only."})
+
+        if path == "/api/updates/check":
+            return self._json(200, self.updater.check())
+
+        if path == "/api/updates/install":
+            try:
+                self.updater.install()
+            except RuntimeError as e:
+                return self._json(409, {"error": str(e)})
+            return self._json(202, {"ok": True})
+
+        if path == "/api/updates/settings":
+            self.updater.set_settings(check=body.get("check"), auto_install=body.get("auto_install"))
+            return self._json(200, self.updater.info())
 
         if path == "/api/users/add":
             with _auth_lock:
@@ -468,33 +579,6 @@ class TLSServer(ThreadingHTTPServer):
         super().handle_error(request, client_address)
 
 
-def _make_httpd():
-    CONF_DIR.mkdir(parents=True, exist_ok=True)
-    if os.name == "posix":
-        try:
-            os.chmod(CONF_DIR, 0o700)
-        except OSError:
-            pass
-    if not (CERT.exists() and KEY.exists()):
-        _gen_cert()
-    cfg = CONF_DIR / "models.json"
-    if not cfg.exists():
-        cfg = ROOT / "models.json"
-    eng = Engine(cfg, STATE_DIR)
-    ins = Installer(eng)
-    Handler.engine = eng
-    Handler.installer = ins
-    threading.Thread(target=eng.reconcile_at_boot, daemon=True).start()
-
-    httpd = TLSServer((BIND, PORT), Handler)
-    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
-    ctx.load_cert_chain(CERT, KEY)
-    # Handshake lazily in the worker thread so a slow client can't stall accept().
-    httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True, do_handshake_on_connect=False)
-    return httpd, eng
-
-
 def _gen_cert():
     """Generate a self-signed cert if none exists (10 years, with SANs)."""
     import subprocess
@@ -547,14 +631,20 @@ def _make_httpd():
         cfg = ROOT / "models.json"
     if DEMO:
         cfg = _demo_config(cfg)
-    eng = Engine(cfg, STATE_DIR)
+    eng = Engine(cfg, STATE_DIR, catalog_path=ROOT / "catalog.json", conf_dir=CONF_DIR)
     ins = Installer(eng)
+    upd = Updater(eng, ins)
     Handler.engine = eng
     Handler.installer = ins
+    Handler.updater = upd
     if not DEMO:
         threading.Thread(target=eng.reconcile_at_boot, daemon=True).start()
+        threading.Thread(target=upd.loop, daemon=True).start()
 
     httpd = TLSServer((BIND, PORT), Handler)
+    if DEMO and os.environ.get("SWAPPER_DEMO_HTTP") == "1" and BIND in ("127.0.0.1", "localhost", "::1"):
+        # Local UI previews only: plain HTTP on loopback, never with real data.
+        return httpd, eng
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     ctx.load_cert_chain(CERT, KEY)
@@ -566,7 +656,8 @@ def _make_httpd():
 def main():
     CONF_DIR.mkdir(parents=True, exist_ok=True)
     httpd, eng = _make_httpd()
-    print(f"Spark Swapper listening on https://{BIND}:{PORT}  (config {eng.config_path}, demo={DEMO})", flush=True)
+    print(f"Spark Swapper {VERSION} listening on https://{BIND}:{PORT}  ({hardware.label(eng.platform)}: "
+          f"{eng.platform_evidence}; config {eng.config_path}, demo={DEMO})", flush=True)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

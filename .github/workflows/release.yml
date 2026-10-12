@@ -1,0 +1,72 @@
+name: release
+
+# Publishes a GitHub release whenever swapper/VERSION changes on main: a
+# spark-swapper-<version>.tar.gz (git archive of that commit) plus SHA256SUMS.
+# Installed Swappers look for this every Sunday and install it unless an admin
+# turned automatic updates off. Bump swapper/VERSION and add a CHANGELOG.md
+# section for the version to ship one.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "swapper/VERSION"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Test
+        run: |
+          python -m unittest discover -s tests -v
+          node --check swapper/web/app.js
+          bash -n deploy/install.sh deploy/update.sh install-swapper.sh
+
+      - name: Version
+        id: v
+        run: |
+          ver=$(tr -d '[:space:]' < swapper/VERSION)
+          [[ "$ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "swapper/VERSION must be X.Y.Z, got '$ver'" >&2; exit 1; }
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+          if git rev-parse -q --verify "refs/tags/v$ver" >/dev/null; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "v$ver is already released; nothing to do."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Package
+        if: steps.v.outputs.exists == 'false'
+        run: |
+          ver=${{ steps.v.outputs.version }}
+          git archive --format=tar.gz --prefix="spark-swapper-$ver/" -o "spark-swapper-$ver.tar.gz" HEAD
+          sha256sum "spark-swapper-$ver.tar.gz" > SHA256SUMS
+          cat SHA256SUMS
+          # Release notes: this version's section of CHANGELOG.md.
+          awk -v v="$ver" '$0 ~ "^## " v "( |$)" {on=1; next} on && /^## / {exit} on {print}' CHANGELOG.md > notes.md || true
+          [[ -s notes.md ]] || echo "Spark Swapper $ver." > notes.md
+
+      - name: Publish
+        if: steps.v.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ver=${{ steps.v.outputs.version }}
+          gh release create "v$ver" "spark-swapper-$ver.tar.gz" SHA256SUMS \
+            --title "Spark Swapper $ver" --notes-file notes.md --target "$GITHUB_SHA"

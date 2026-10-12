@@ -37,11 +37,13 @@
   <!-- App -->
   <section id="dash" hidden>
     <header class="top">
-      <div class="brand"><span class="mark small" aria-hidden="true"></span>Spark Swapper</div>
-      <nav class="tabs">
+      <div class="brand"><span class="mark small" aria-hidden="true"></span>Spark Swapper<span class="plat" id="plat"></span></div>
+      <nav class="tabs" aria-label="Sections">
         <button class="tab" data-tab="models" id="tab-models">Models</button>
+        <button class="tab" data-tab="connect" id="tab-connect">Connect</button>
         <button class="tab" data-tab="provision" id="tab-provision">Provisioning</button>
         <button class="tab" data-tab="users" id="tab-users" hidden>Users</button>
+        <button class="tab" data-tab="settings" id="tab-settings" hidden>Settings<i class="badge" id="upd-dot" hidden></i></button>
       </nav>
       <nav class="acct">
         <span class="who" id="who"></span>
@@ -53,6 +55,8 @@
     <main>
       <!-- ── Models tab ── -->
       <div id="pane-models">
+        <p class="note slim" id="upd-note" hidden></p>
+
         <div class="now" id="now">
           <span class="pulse" id="now-dot"></span>
           <div>
@@ -77,13 +81,26 @@
           </details>
         </section>
 
+        <section class="panel" id="minstall" hidden>
+          <div class="panel-head">
+            <h2 id="minstall-title">Installing</h2>
+            <span class="muted small" id="minstall-time"></span>
+          </div>
+          <ol class="steps" id="minstall-steps"></ol>
+          <p class="note" id="minstall-note" hidden></p>
+          <details id="minstall-log-wrap">
+            <summary>Details</summary>
+            <pre id="minstall-log" class="log"></pre>
+          </details>
+        </section>
+
         <section class="panel">
           <div class="panel-head">
             <h2>Keys &amp; connection</h2>
             <button class="btn ghost small" id="btn-creds">Show</button>
           </div>
           <div id="creds" hidden></div>
-          <p class="muted small" id="creds-hint">Your OpenClaw token and model API key, read from the Spark itself. This page is self-signed TLS — <a href="/cert.crt" download>download the certificate</a> to trust it (see <a href="#aws-ssl" data-aws>how to add it to AWS / a browser</a>).</p>
+          <p class="muted small" id="creds-hint">Your OpenClaw token and model API key, read from the box itself. Setting up DSH or a coding tool? The <a href="#connect" data-goto="connect">Connect</a> tab walks you through it.</p>
         </section>
 
         <footer class="foot">
@@ -93,16 +110,74 @@
             <span id="mem-text" class="muted"></span>
           </div>
           <div class="health">
-            <span><i class="dot" id="h-nginx"></i>nginx :11443</span>
+            <span id="h-gpu" class="muted" hidden></span>
+            <span><i class="dot" id="h-nginx"></i><span id="h-nginx-label">HTTPS front :11443</span></span>
             <span><i class="dot" id="h-gw"></i>OpenClaw gateway</span>
             <span id="h-oc" class="muted"></span>
           </div>
         </footer>
       </div>
 
+      <!-- ── Connect tab ── -->
+      <div id="pane-connect" hidden>
+        <section class="panel">
+          <div class="panel-head">
+            <h2>Your model API</h2>
+            <button class="btn ghost small" id="btn-test">Test it</button>
+          </div>
+          <p class="muted small">Any OpenAI-compatible app can use the model this box is serving. It's the same address and key whichever model you switch to; only the model ID changes.</p>
+          <div id="api-rows"></div>
+          <p class="note slim" id="test-result" hidden></p>
+        </section>
+
+        <section class="panel" id="dsh">
+          <div class="panel-head"><h2>Connect DSH (Mac or Windows)</h2></div>
+          <ol class="howto">
+            <li>In DSH, open the setup wizard (or <em>Settings ▸ AI Models ▸ Add</em>) and choose <strong>My Spark Swapper</strong>.</li>
+            <li>Create a connection code here, copy it, and paste it there. DSH sets up the model, model switching and this box's security certificate in one go.</li>
+          </ol>
+          <div class="row wrap">
+            <input id="tok-label" maxlength="80" placeholder="Name it, e.g. DSH on my laptop" aria-label="Name for this connection">
+            <button class="btn primary" id="btn-code">Create connection code</button>
+          </div>
+          <div id="code-box" hidden>
+            <label>Connection code
+              <textarea id="code" readonly rows="4" spellcheck="false"></textarea>
+            </label>
+            <div class="row"><button class="btn ghost small" id="btn-copy-code">Copy</button><span class="muted small">Treat it like a password: it lets DSH switch models and use the API. It's shown once; you can revoke it below.</span></div>
+          </div>
+          <h3 class="sub">App connections</h3>
+          <table class="users" id="tok-table">
+            <thead><tr><th>Name</th><th>User</th><th>Created</th><th>Last used</th><th></th></tr></thead>
+            <tbody id="tok-body"></tbody>
+          </table>
+          <p class="muted small" id="tok-empty" hidden>None yet.</p>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head"><h2>Use it from a coding tool</h2></div>
+          <p class="muted small">Pick your tool. Every snippet already has this box's address, key and current model filled in. Trust the certificate first (below) — then most tools need nothing else.</p>
+          <div class="pills" id="tool-pills" role="tablist" aria-label="Tools"></div>
+          <div id="tool-body"></div>
+        </section>
+
+        <section class="panel" id="trust">
+          <div class="panel-head"><h2>Trust this box's certificate</h2><a href="/cert.crt" download class="btn ghost small">Download the certificate</a></div>
+          <p class="muted small">This page and the model API use a self-signed certificate. Apps refuse it until your computer trusts it. Check the fingerprint after downloading — it should match: <code id="fp" class="fp"></code></p>
+          <ol class="aws">
+            <li><strong>macOS:</strong> open the <code>.crt</code>, drag it into <em>Keychain Access</em> → System. Select it, right‑click → <em>Get Info</em> → <em>Trust</em> → set <em>"When using this certificate"</em> to <strong>Always Trust</strong>.</li>
+            <li><strong>Windows:</strong> double-click the <code>.crt</code> → <em>Install Certificate</em> → Local Machine (or Current User) → <em>Place all certificates in the following store</em> → <strong>Trusted Root Certification Authorities</strong>.</li>
+            <li><strong>Linux / CLI:</strong> <code>sudo cp spark-swapper.crt /usr/local/share/ca-certificates/spark-swapper.crt && sudo update-ca-certificates</code>. Check it: <code>openssl x509 -in spark-swapper.crt -noout -fingerprint -sha256</code>.</li>
+            <li><strong>Node.js tools</strong> (OpenCode, Qwen Code, Claude Code…): also <code>export NODE_EXTRA_CA_CERTS="$HOME/spark-swapper.crt"</code> — Node keeps its own list.</li>
+            <li><strong>Python:</strong> pass it to the client (<code>httpx.Client(verify="spark-swapper.crt")</code>), or set <code>REQUESTS_CA_BUNDLE</code> for <code>requests</code>.</li>
+            <li><strong>AWS EC2 / Lightsail:</strong> copy it to <code>/usr/local/share/ca-certificates/</code> and run <code>update-ca-certificates</code> (bake it into your AMI). An ALB, CloudFront or API Gateway needs a CA-signed certificate instead (Let's Encrypt / ACM). For boto3 from any host: <code>os.environ["AWS_CA_BUNDLE"]</code>.</li>
+          </ol>
+        </section>
+      </div>
+
       <!-- ── Provisioning tab ── -->
       <div id="pane-provision" hidden>
-        <p class="muted" style="margin-top:4px">Everything that's already on the Spark is detected for you; each button does the install when something's missing and just reports "present" when it isn't. Installs run as root and stream their log here.</p>
+        <p class="muted" style="margin-top:4px" id="prov-intro">Everything that's already on the box is detected for you; each button installs what's missing and just re-checks what isn't. Installs run as root and stream their log here. Models install from the <a href="#models" data-goto="models">Models</a> tab.</p>
         <div class="prov" id="prov"></div>
         <section class="panel" id="prov-job" hidden>
           <div class="panel-head">
@@ -116,31 +191,47 @@
             <pre id="prov-log" class="log"></pre>
           </details>
         </section>
-        <section class="panel" id="aws-ssl">
-          <div class="panel-head"><h2>Trusting the self-signed SSL (AWS / EC2, macOS, Windows, curl)</h2></div>
-          <p class="muted small">This page (and, if you set it up, the model API front on :11443) uses a self-signed certificate. Browsers and AWS tools will reject it until you add it to a trust store. <a href="/cert.crt" download class="btn ghost small" style="display:inline-block">Download the certificate</a>, then:</p>
-          <ol class="aws">
-            <li><strong>macOS:</strong> open the <code>.crt</code>, drag into <em>Keychain Access</em> → System. Select it, right‑click → <em>Show Info</em> → <em>Trust</em> → set <em>"When using this certificate"</em> to <strong>Always Trust</strong>. Lock/unlock the System keychain.</li>
-            <li><strong>Windows:</strong> Certificate Viewer → <em>Import</em> → place in the <strong>Trusted Root Certification Authorities</strong> store (or per-user), then "Intermediate Certification Authorities" if prompted.</li>
-            <li><strong>Linux / CLI:</strong> <code>sudo cp spark-swapper.crt /usr/local/share/ca-certificates/spark-swapper.crt && sudo update-ca-certificates</code>. Then <code>curl --cacert spark-swapper.crt https://&lt;host&gt;:8999/</code> works without <code>-k</code>.</li>
-            <li><strong>AWS EC2 / Lightsail (trust from an EC2 host or your AMI):</strong> copy the cert to <code>/usr/local/share/ca-certificates/spark-swapper.crt</code> (EC2 AMIs: bake it in, or run on each instance) then <code>update-ca-certificates</code>. For <strong>ALB / CloudFront / API Gateway</strong> you must use a <em>CA‑signed</em> cert (Let's Encrypt / ACM) — a self‑signed cert can't be attached there; trust it on the client side instead (steps 1–3).</li>
-            <li><strong>AWS SDK / boto3 (Python, from any host):</strong> <code>import boto3, os; os.environ["AWS_CA_BUNDLE"]=os.path.expanduser("~/spark-swapper.crt"); s3 = boto3.client("s3")</code> — or pass <code>verify=...</code> to <code>requests</code>/<code>urllib</code>.</li>
-          </ol>
-        </section>
+        <p class="muted small">Trusting the certificate on your computers and in AWS: see the <a href="#trust" data-goto="connect">Connect</a> tab.</p>
       </div>
 
       <!-- ── Users tab (admin) ── -->
       <div id="pane-users" hidden>
         <section class="panel">
           <div class="panel-head"><h2>Users</h2><button class="btn primary small" id="btn-add-user">Add user</button></div>
-          <p class="muted small">Anyone with an account can view the running model, swap it, and grab connection info. Only admins can manage users.</p>
+          <p class="muted small">Anyone with an account can view the running model, swap it, install models and grab connection info. Only admins can manage users and updates.</p>
           <table class="users">
             <thead><tr><th>Username</th><th>Role</th><th>Created</th><th></th></tr></thead>
             <tbody id="users-body"></tbody>
           </table>
         </section>
       </div>
+
+      <!-- ── Settings tab (admin) ── -->
+      <div id="pane-settings" hidden>
+        <section class="panel">
+          <div class="panel-head">
+            <h2>Updates</h2>
+            <span class="muted small" id="upd-current"></span>
+          </div>
+          <p id="upd-status"></p>
+          <label class="check"><input type="checkbox" id="upd-check"> Check GitHub for a new version every Sunday</label>
+          <label class="check"><input type="checkbox" id="upd-auto"> Install new versions automatically <span class="muted small">— models keep serving; only this page restarts</span></label>
+          <p class="muted small" id="upd-next"></p>
+          <div class="row">
+            <button class="btn ghost" id="btn-upd-check">Check now</button>
+            <button class="btn primary" id="btn-upd-install" hidden>Update now</button>
+          </div>
+          <p class="note slim" id="upd-result" hidden></p>
+          <details id="upd-notes-wrap" hidden><summary>What's new</summary><pre class="log notes" id="upd-notes"></pre></details>
+          <details id="upd-log-wrap"><summary>Update log</summary><pre class="log" id="upd-log"></pre></details>
+        </section>
+        <section class="panel">
+          <div class="panel-head"><h2>This box</h2></div>
+          <div id="about"></div>
+        </section>
+      </div>
     </main>
+    <p class="muted small ver" id="ver"></p>
   </section>
 
   <dialog id="confirm">
