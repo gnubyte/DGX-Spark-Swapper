@@ -293,6 +293,8 @@ check its fingerprint against the one the Connect tab shows
   with a read-only system; the weights and builds live in `/var/lib/spark-swapper-runtime`.
 - Recipe scripts run as the box's user (via `setpriv`), with secrets passed in the
   environment rather than on the command line.
+- `sudo spark-swapper-front` sets up the HTTPS front from a shell (DSH's Spark guide uses it);
+  an update replaces a front written by DSH's guide before 2.0 with one that checks the key.
 - Downloads (weights, llama.cpp, updates) are verified against published SHA-256s
   before use; archives are unpacked with path checks.
 - Strict CSP (no inline scripts), TLS 1.2+ only, `X-Frame-Options: DENY`.

@@ -508,6 +508,22 @@ class FetchTests(TempDir):
         self.assertFalse((self.tmp / "escaped.txt").exists())
 
 
+class SetupFrontTests(TempDir):
+    def test_setup_front_from_the_shell(self):
+        """`app.py --setup-front` (spark-swapper-front) runs the HTTPS-front setup without the web page."""
+        conf = self.tmp / "conf"
+        conf.mkdir()
+        (conf / "models.json").write_text(json.dumps(site()))
+        env = {**os.environ, "SWAPPER_CONF": str(conf), "SWAPPER_STATE": str(self.tmp / "state"),
+               "SWAPPER_PLATFORM": "nvidia-gb10"}
+        p = subprocess.run([sys.executable, str(ROOT / "swapper" / "app.py"), "--setup-front"], env=env,
+                           capture_output=True, text=True, timeout=60)
+        self.assertTrue((conf / "tls.crt").exists(), "makes the certificate when there is none")
+        if os.geteuid() != 0:
+            self.assertEqual(p.returncode, 1)
+            self.assertIn("needs root", p.stderr)
+
+
 # ─────────────────────────────── HTTP API (demo) ───────────────────────────────
 
 def free_port() -> int:

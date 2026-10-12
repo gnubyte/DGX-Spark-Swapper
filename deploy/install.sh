@@ -90,6 +90,14 @@ if [[ ! -s "$CONF/tls.crt" ]]; then
   chmod 600 "$CONF/tls.key"
 fi
 
+# ── HTTPS front helper (also used by DSH's Spark guide) ──
+cat > /usr/local/sbin/spark-swapper-front <<'FRONT'
+#!/usr/bin/env bash
+# Set up nginx on :11443 for the model API, requiring the API key (Provisioning ▸ HTTPS front).
+exec /usr/bin/python3 /opt/spark-swapper/app.py --setup-front "$@"
+FRONT
+chmod 755 /usr/local/sbin/spark-swapper-front
+
 # ── reset-login helper ──
 cat > /usr/local/sbin/spark-swapper-reset-login <<'RESET'
 #!/usr/bin/env bash
@@ -109,6 +117,14 @@ systemctl restart spark-swapper
 
 if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
   ufw allow "$PORT/tcp" >/dev/null && echo "==> ufw: allowed $PORT/tcp"
+fi
+
+# An HTTPS front written before 2.0 (by DSH's Spark guide) doesn't check the API key, which
+# 2.0's TensorFold and Nemotron models need: replace it with Spark Swapper's own.
+FRONT_CONF=/etc/nginx/conf.d/spark-model-front.conf
+if [[ -f "$FRONT_CONF" ]] && grep -q "Written by DSH for Windows" "$FRONT_CONF"; then
+  echo "==> upgrading the :11443 HTTPS front so it requires the API key"
+  /usr/local/sbin/spark-swapper-front || echo "   (couldn't — run Provisioning ▸ HTTPS front on the page)"
 fi
 
 for _ in $(seq 1 120); do

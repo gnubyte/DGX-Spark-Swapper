@@ -672,5 +672,28 @@ def main():
         pass
 
 
+def setup_front() -> int:
+    """`app.py --setup-front` (installed as /usr/local/sbin/spark-swapper-front): set up the
+    :11443 HTTPS front the way Provisioning ▸ HTTPS front does, from a shell — for install.sh
+    and for DSH's Spark guide, which run before anyone has signed in to the page."""
+    CONF_DIR.mkdir(parents=True, exist_ok=True)
+    if not (CERT.exists() and KEY.exists()):
+        _gen_cert()
+    cfg = CONF_DIR / "models.json"
+    if not cfg.exists():
+        cfg = ROOT / "models.json"
+    eng = Engine(cfg, STATE_DIR, catalog_path=ROOT / "catalog.json", conf_dir=CONF_DIR)
+    job = engine.Job("install:ssl", None, ["run"])
+    job.say = lambda msg: print(engine.ANSI.sub("", msg or "").rstrip(), flush=True) if (msg or "").strip() else None
+    try:
+        Installer(eng)._do_ssl(job)
+        return 0
+    except Exception as e:  # noqa: BLE001 — report it and fail the command
+        print(f"✗ {e}", file=sys.stderr, flush=True)
+        return 1
+
+
 if __name__ == "__main__":
+    if "--setup-front" in sys.argv[1:]:
+        sys.exit(setup_front())
     main()
