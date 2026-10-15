@@ -524,6 +524,30 @@ class SetupFrontTests(TempDir):
             self.assertIn("needs root", p.stderr)
 
 
+    def test_install_upgrades_fronts_the_windows_app_wrote(self):
+        """install.sh replaces an HTTPS front written by Vision for Windows's own Spark guide (it doesn't
+        check the API key), under the app's current name and its legacy one, but never Spark Swapper's own."""
+        import re
+        from engine import FRONT_MARK
+        script = (ROOT / "deploy" / "install.sh").read_text()
+        m = re.search(r'grep -qE "([^"]+)" "\$FRONT_CONF"', script)
+        self.assertIsNotNone(m, "install.sh still looks for fronts the Windows app wrote")
+        pattern = m.group(1)
+        fronts = {
+            "# Written by Vision for Windows: an HTTPS front on :11443 for the Spark's model API.": True,
+            # Legacy: the Windows app was called DSH before it was renamed Vision, and boxes keep
+            # fronts that carry the old marker.
+            "# Written by DSH for Windows: an HTTPS front on :11443 for the Spark's model API.": True,
+            "# Written by DSH for Windows. HTTPS front for the Spark's model API and the OpenClaw gateway.": True,
+            FRONT_MARK: False,
+        }
+        for i, (first_line, upgrade) in enumerate(fronts.items()):
+            conf = self.tmp / f"front-{i}.conf"
+            conf.write_text(f"{first_line}\nserver {{\n  listen 11443 ssl;\n}}\n")
+            found = subprocess.run(["grep", "-qE", pattern, str(conf)]).returncode == 0
+            self.assertEqual(found, upgrade, first_line)
+
+
 # ─────────────────────────────── HTTP API (demo) ───────────────────────────────
 
 def free_port() -> int:

@@ -90,7 +90,7 @@ if [[ ! -s "$CONF/tls.crt" ]]; then
   chmod 600 "$CONF/tls.key"
 fi
 
-# ── HTTPS front helper (also used by DSH's Spark guide) ──
+# ── HTTPS front helper (also used by Vision's Spark guide) ──
 cat > /usr/local/sbin/spark-swapper-front <<'FRONT'
 #!/usr/bin/env bash
 # Set up nginx on :11443 for the model API, requiring the API key (Provisioning ▸ HTTPS front).
@@ -119,10 +119,13 @@ if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q "Status: active
   ufw allow "$PORT/tcp" >/dev/null && echo "==> ufw: allowed $PORT/tcp"
 fi
 
-# An HTTPS front written before 2.0 (by DSH's Spark guide) doesn't check the API key, which
+# An HTTPS front written by the Windows app's own Spark guide doesn't check the API key, which
 # 2.0's TensorFold and Nemotron models need: replace it with Spark Swapper's own.
+# That app is Vision for Windows; it was called DSH for Windows before, and fronts it
+# wrote then carry the legacy marker "Written by DSH for Windows" — keep matching it
+# for as long as such boxes may exist (an old marker on disk never changes by itself).
 FRONT_CONF=/etc/nginx/conf.d/spark-model-front.conf
-if [[ -f "$FRONT_CONF" ]] && grep -q "Written by DSH for Windows" "$FRONT_CONF"; then
+if [[ -f "$FRONT_CONF" ]] && grep -qE "Written by (Vision|DSH) for Windows" "$FRONT_CONF"; then
   echo "==> upgrading the :11443 HTTPS front so it requires the API key"
   /usr/local/sbin/spark-swapper-front || echo "   (couldn't — run Provisioning ▸ HTTPS front on the page)"
 fi
