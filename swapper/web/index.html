@@ -132,6 +132,11 @@
 
         <section class="panel" id="vision">
           <div class="panel-head"><h2>Connect Vision (Mac or Windows)</h2></div>
+          <!-- Legacy name, kept on purpose: apps installed before the rename (DSH for Mac and
+               DSH for Windows) tell their users to choose "Connect DSH", and that text can't
+               change on their side. This line is the page's only mention of the old name; remove
+               it once those apps have updated to Vision. -->
+          <p class="muted small" id="vision-formerly">Your app says <strong>Connect DSH</strong>? That's this section: Vision was previously called DSH.</p>
           <ol class="howto">
             <li>In Vision, open the setup wizard (or <em>Settings ▸ AI Models ▸ Add</em>) and choose <strong>My Spark Swapper</strong>.</li>
             <li>Create a connection code here, copy it, and paste it there. Vision sets up the model, model switching and this box's security certificate in one go.</li>

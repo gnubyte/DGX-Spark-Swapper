@@ -9,6 +9,7 @@ import http.server
 import io
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -640,6 +641,22 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(code, 201)
         self.assertEqual(made["label"], "Vision")
         self.assertEqual(self.call("/api/tokens/revoke", {"id": made["id"]}, cookie=cookie)[0], 200)
+
+    def test_connect_section_answers_to_its_old_name_and_nothing_else_does(self):
+        # Apps installed before the rename (DSH for Mac and Windows) tell their users to choose
+        # "Connect DSH", and their text can't change. The Connect Vision section says it's the
+        # one they mean; nowhere else on the page may still use the old name.
+        with urllib.request.urlopen(self.base + "/", timeout=10) as r:
+            page = r.read().decode()
+        section = re.search(r'<section class="panel" id="vision">(.*?)</section>', page, re.S)
+        self.assertIsNotNone(section, "the Connect section is #vision")
+        self.assertIn("<h2>Connect Vision (Mac or Windows)</h2>", section.group(1))
+        hint = re.search(r'<p [^>]*id="vision-formerly"[^>]*>(.*?)</p>', section.group(1), re.S)
+        self.assertIsNotNone(hint, "the section carries the legacy-name hint")
+        self.assertIn("Connect DSH", re.sub(r"<[^>]+>", "", hint.group(1)))
+        rest = re.sub(r"<!--.*?-->", "", page.replace(hint.group(0), ""), flags=re.S)
+        leftovers = [rest[max(0, m.start() - 40):m.end() + 40] for m in re.finditer(r"\bdsh\b", rest, re.I)]
+        self.assertEqual(leftovers, [], "the old name is still on the page outside the hint")
 
     def test_posts_need_the_custom_header(self):
         req = urllib.request.Request(self.base + "/api/login", data=b"{}", headers={"Content-Type": "application/json"})

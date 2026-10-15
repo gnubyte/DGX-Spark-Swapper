@@ -4,8 +4,9 @@
 
 - **Connect Vision.** The Mac and Windows apps that connect with a connection code are
   now called Vision, and the Connect tab, its setup guide and the default name of a new
-  app connection say so. Vision was previously called DSH: app connections made under
-  that name keep working, and links to the old `#dsh` section open the new one.
+  app connection say so. Vision was previously called DSH: the section notes this for
+  anyone whose app still says *Connect DSH*, app connections made under that name keep
+  working, and links to the old `#dsh` section open the new one.
 - An update also replaces an HTTPS front written by Vision for Windows's own Spark guide
   (as it already did for fronts that app wrote under its old name), so the front checks
   the API key.

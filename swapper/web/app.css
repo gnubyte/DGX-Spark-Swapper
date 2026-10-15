@@ -246,6 +246,7 @@ label.check input { width: auto; margin: 3px 0 0; flex: none; }
 /* connect tab */
 .howto { margin: 0 0 14px; padding-left: 20px; }
 .howto li { margin-bottom: 6px; }
+#vision-formerly { margin: -6px 0 12px; }
 .pills { display: flex; flex-wrap: wrap; gap: 6px; margin: 12px 0 14px; }
 .pill { font: inherit; font-size: 13px; padding: 6px 12px; border-radius: 999px; border: 1px solid var(--line);
         background: var(--bg); color: var(--muted); cursor: pointer; }
