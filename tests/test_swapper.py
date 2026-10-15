@@ -164,7 +164,7 @@ class HardwareTests(unittest.TestCase):
 class TokenTests(TempDir):
     def test_create_verify_revoke(self):
         store = tokens.TokenStore(self.tmp / "tokens.json")
-        tok, info = store.create("pat", "DSH on laptop")
+        tok, info = store.create("pat", "Vision on laptop")
         self.assertRegex(tok, tokens.TOKEN_RE)
         self.assertEqual(store.verify(tok)["user"], "pat")
         self.assertIsNone(store.verify(tok[:-1] + ("A" if tok[-1] != "A" else "B")))
@@ -633,6 +633,13 @@ class ApiTests(unittest.TestCase):
         code, body, _ = self.call("/api/status", headers=bearer)
         self.assertEqual(code, 401)
         self.assertIn("connection", body["error"])
+
+    def test_new_connections_are_named_for_vision_by_default(self):
+        cookie = self.login()
+        code, made, _ = self.call("/api/tokens/create", {}, cookie=cookie)
+        self.assertEqual(code, 201)
+        self.assertEqual(made["label"], "Vision")
+        self.assertEqual(self.call("/api/tokens/revoke", {"id": made["id"]}, cookie=cookie)[0], 200)
 
     def test_posts_need_the_custom_header(self):
         req = urllib.request.Request(self.base + "/api/login", data=b"{}", headers={"Content-Type": "application/json"})

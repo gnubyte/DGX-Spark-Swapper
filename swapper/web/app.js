@@ -134,6 +134,12 @@ $("gate-form").addEventListener("submit", async (ev) => {
 /* ───────────── app shell / tabs ───────────── */
 
 const TABS = ["models", "connect", "provision", "users", "settings"];
+// Sections inside a tab that links may point at: #vision opens the Connect tab there.
+const SECTION_TABS = new Map([["vision", "connect"]]);
+// Legacy anchors that older guides and bookmarks still use. The Vision apps were called
+// DSH before they were renamed, and their section here was #dsh — keep it working.
+const LEGACY_ANCHORS = new Map([["dsh", "vision"]]);
+const sectionId = (id) => LEGACY_ANCHORS.get(id) || id;
 
 function showDash() {
   $("gate").hidden = true;
@@ -144,8 +150,9 @@ function showDash() {
   $("tab-settings").hidden = !admin;
   $("plat").textContent = session.platform_label || "";
   $("ver").textContent = `Spark Swapper ${session.version || ""}${session.hostname ? ` · ${session.hostname}` : ""}`;
-  const wanted = (location.hash || "").slice(1);
-  switchTab(TABS.includes(wanted) && (admin || !["users", "settings"].includes(wanted)) ? wanted : "models");
+  const wanted = sectionId((location.hash || "").slice(1));
+  if (SECTION_TABS.has(wanted)) switchTab(SECTION_TABS.get(wanted), wanted);
+  else switchTab(TABS.includes(wanted) && (admin || !["users", "settings"].includes(wanted)) ? wanted : "models");
   if (isDemo) toast("Demo mode — sample data, nothing is actually installed.");
 }
 
@@ -477,7 +484,8 @@ async function loadConnect(anchor) {
     renderTools();
     renderTokens(toks.tokens || []);
     $("fp").textContent = info.fingerprint || "(no certificate yet)";
-    if (anchor && $(anchor)) $(anchor).scrollIntoView({ behavior: "smooth", block: "start" });
+    const target = anchor && $(sectionId(anchor));
+    if (target) target.scrollIntoView({ behavior: "smooth", block: "start" });
   } catch (e) {
     if (e.status === 401) return boot();
     toast(e.message);
@@ -539,7 +547,7 @@ $("btn-test").addEventListener("click", async () => {
 });
 
 $("btn-code").addEventListener("click", async () => {
-  const label = $("tok-label").value.trim() || "DSH";
+  const label = $("tok-label").value.trim() || "Vision";
   try {
     const r = await api("/api/tokens/create", { label });
     $("code").value = r.code;
@@ -599,9 +607,9 @@ const TOOLS = [
     snip(`export OPENAI_BASE_URL="${v.base}"\nexport OPENAI_API_KEY="${v.key}"\nexport OPENAI_MODEL="${v.model}"`, "macOS / Linux"),
     snip(`setx OPENAI_BASE_URL "${v.base}"\nsetx OPENAI_API_KEY "${v.key}"\nsetx OPENAI_MODEL "${v.model}"`, "Windows (new terminals pick these up)"),
   ] },
-  { key: "dsh", label: "DSH", build: () => [
-    rich("p", "DSH for Mac and DSH for Windows connect with a **connection code** — no copying of addresses or keys, and they can switch models on this box for you."),
-    (() => { const p = el("p"); const a = el("a", "", "Create a connection code ↑"); a.href = "#dsh"; a.dataset.goto = "connect"; p.append(a); return p; })(),
+  { key: "vision", label: "Vision", build: () => [
+    rich("p", "Vision for Mac and Vision for Windows connect with a **connection code** — no copying of addresses or keys, and they can switch models on this box for you."),
+    (() => { const p = el("p"); const a = el("a", "", "Create a connection code ↑"); a.href = "#vision"; a.dataset.goto = "connect"; p.append(a); return p; })(),
   ] },
   { key: "curl", label: "curl", build: (v) => [
     snip(`curl --cacert spark-swapper.crt ${v.base}/chat/completions \\\n  -H "Authorization: Bearer ${v.key}" \\\n  -H "Content-Type: application/json" \\\n  -d '{"model": "${v.model}", "messages": [{"role": "user", "content": "Hello!"}]}'`),

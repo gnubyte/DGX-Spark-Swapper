@@ -481,7 +481,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(202, {"ok": True, "job": job.to_dict()})
 
         if path == "/api/tokens/create":
-            label = str(body.get("label", "") or "DSH").strip()[:80]
+            label = str(body.get("label", "") or "Vision").strip()[:80]
             token, info = TOKENS.create(me, label)
             connect = self.engine.connect_info(CERT, PORT, self._host())
             return self._json(201, {"ok": True, "id": info["id"], "token": token, "label": info["label"],
@@ -675,7 +675,7 @@ def main():
 def setup_front() -> int:
     """`app.py --setup-front` (installed as /usr/local/sbin/spark-swapper-front): set up the
     :11443 HTTPS front the way Provisioning ▸ HTTPS front does, from a shell — for install.sh
-    and for DSH's Spark guide, which run before anyone has signed in to the page."""
+    and for Vision's Spark guide, which run before anyone has signed in to the page."""
     CONF_DIR.mkdir(parents=True, exist_ok=True)
     if not (CERT.exists() and KEY.exists()):
         _gen_cert()

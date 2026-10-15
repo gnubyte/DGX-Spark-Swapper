@@ -1,4 +1,4 @@
-"""App connections: long-lived tokens that let DSH (or a script) use the API
+"""App connections: long-lived tokens that let Vision (or a script) use the API
 without a password.
 
 A token is `sst_<id>_<secret>`: the id names it, the secret proves it. Only a
@@ -106,7 +106,7 @@ class TokenStore:
 
 
 def connection_code(info: dict, token: str, user: str) -> str:
-    """The text DSH's "Connect my Spark Swapper" accepts: SSC1: + base64url(JSON)."""
+    """The text Vision's "Connect my Spark Swapper" accepts: SSC1: + base64url(JSON)."""
     payload = {"v": 1, **{k: info.get(k) for k in ("name", "hostname", "platform", "version", "swapper_url",
                                                   "api_base", "api_key", "model", "context", "fingerprint")},
                "token": token, "user": user}
@@ -115,7 +115,7 @@ def connection_code(info: dict, token: str, user: str) -> str:
 
 
 def decode_code(code: str) -> dict:
-    """The inverse of connection_code (used by the tests; DSH has its own)."""
+    """The inverse of connection_code (used by the tests; Vision has its own)."""
     text = "".join((code or "").split())
     if text.upper().startswith(CODE_PREFIX):
         text = text[len(CODE_PREFIX):]

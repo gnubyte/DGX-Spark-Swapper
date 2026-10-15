@@ -128,7 +128,7 @@ def port_open(port: int, host: str = "127.0.0.1") -> bool:
 
 
 def cert_fingerprint(cert_path: Path) -> str | None:
-    """SHA-256 of the certificate's DER, as AA:BB:… (what DSH pins)."""
+    """SHA-256 of the certificate's DER, as AA:BB:… (what Vision pins)."""
     try:
         pem = Path(cert_path).read_text()
     except OSError:

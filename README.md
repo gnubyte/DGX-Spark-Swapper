@@ -3,7 +3,7 @@
 A calm, multi-user web control panel for local LLM boxes — the **NVIDIA DGX Spark**
 and the **AMD Strix Halo** (Ryzen AI Max+ 395, 128 GB). Switch between the models it
 serves with one click, install new ones with their published speed and context in
-front of you, connect DSH and your coding tools, and let it keep itself up to date —
+front of you, connect Vision and your coding tools, and let it keep itself up to date —
 all over HTTPS with a self-signed certificate.
 
 Built with Python (standard library only) + a small vanilla-JS frontend. No pip,
@@ -35,7 +35,7 @@ no npm on the host.
   the previous one is brought back automatically.
 
 **Connect tab** — everything another app needs: the OpenAI-compatible base URL, API
-key and current model ID (with a **Test** button), **connection codes for DSH**,
+key and current model ID (with a **Test** button), **connection codes for Vision**,
 ready-to-paste setup for curl, Python, JavaScript, Continue, Cline / Roo / Kilo, Aider,
 OpenCode, Qwen Code, Claude Code (with a model that speaks the Anthropic API) and
 OpenClaw, and how to trust the certificate on macOS, Windows, Linux, Node, Python and AWS.
@@ -100,7 +100,7 @@ build is checked against the SHA-256 the release publishes.
 Set `"api_key"` in `/etc/spark-swapper/models.json` (letters, digits, `.`, `_`, `-`), then
 `sudo systemctl restart spark-swapper`, run *Provisioning ▸ HTTPS front* again, and switch
 models once (the SGLang container is recreated with the new key automatically). Connected
-apps need the new key — DSH users paste a new connection code.
+apps need the new key — Vision users paste a new connection code.
 
 Other switches in that file: `"allow_open_front": true` lets key-less models start behind a
 front that doesn't check the key (not recommended); `"llamacpp_sandbox": false` runs
@@ -184,11 +184,12 @@ To update by hand: `git -C ~/spark-swapper pull && sudo bash ~/spark-swapper/dep
 
 ## Connecting apps
 
-**DSH (Mac and Windows):** Connect tab ▸ *Connect DSH* ▸ **Create connection code**, then
-paste it into DSH's setup wizard (*My Spark Swapper*). The code carries the API address
-and key, the certificate's SHA-256 fingerprint (DSH pins it — no "untrusted
-certificate" dance), and an **app token** that lets DSH show what's serving and switch
+**Vision (Mac and Windows):** Connect tab ▸ *Connect Vision* ▸ **Create connection code**, then
+paste it into Vision's setup wizard (*My Spark Swapper*). The code carries the API address
+and key, the certificate's SHA-256 fingerprint (Vision pins it — no "untrusted
+certificate" dance), and an **app token** that lets Vision show what's serving and switch
 models without your password. Revoke a connection on the same tab at any time.
+(Vision was previously called DSH; connections made under the old name keep working.)
 
 The code is `SSC1:` + base64url (no padding) of JSON:
 
@@ -293,8 +294,9 @@ check its fingerprint against the one the Connect tab shows
   with a read-only system; the weights and builds live in `/var/lib/spark-swapper-runtime`.
 - Recipe scripts run as the box's user (via `setpriv`), with secrets passed in the
   environment rather than on the command line.
-- `sudo spark-swapper-front` sets up the HTTPS front from a shell (DSH's Spark guide uses it);
-  an update replaces a front written by DSH's guide before 2.0 with one that checks the key.
+- `sudo spark-swapper-front` sets up the HTTPS front from a shell (Vision's Spark guide uses it);
+  an update replaces a front written by the Windows app's own Spark guide with one that
+  checks the key.
 - Downloads (weights, llama.cpp, updates) are verified against published SHA-256s
   before use; archives are unpacked with path checks.
 - Strict CSP (no inline scripts), TLS 1.2+ only, `X-Frame-Options: DENY`.

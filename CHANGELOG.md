@@ -1,5 +1,15 @@
 # Changelog
 
+## 2.0.1
+
+- **Connect Vision.** The Mac and Windows apps that connect with a connection code are
+  now called Vision, and the Connect tab, its setup guide and the default name of a new
+  app connection say so. Vision was previously called DSH: app connections made under
+  that name keep working, and links to the old `#dsh` section open the new one.
+- An update also replaces an HTTPS front written by Vision for Windows's own Spark guide
+  (as it already did for fronts that app wrote under its old name), so the front checks
+  the API key.
+
 ## 2.0.0
 
 - **AMD Strix Halo support.** Spark Swapper now runs on a Ryzen AI Max+ 395 box with
@@ -18,7 +28,7 @@
 - **Connect tab.** The API address, key and model with a test button; copy-paste setup
   for curl, Python, JavaScript, Continue, Cline / Roo / Kilo, Aider, OpenCode, Qwen
   Code, Claude Code and OpenClaw; certificate trust steps.
-- **Connection codes for DSH.** DSH for Mac and Windows connect with one pasted code:
+- **Connection codes for Vision.** Vision for Mac and Windows connect with one pasted code:
   API address and key, certificate fingerprint, and an app token for switching models.
   App connections can be revoked.
 - **The HTTPS front checks the API key.** Provisioning ▸ HTTPS front now installs and

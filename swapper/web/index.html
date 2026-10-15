@@ -100,7 +100,7 @@
             <button class="btn ghost small" id="btn-creds">Show</button>
           </div>
           <div id="creds" hidden></div>
-          <p class="muted small" id="creds-hint">Your OpenClaw token and model API key, read from the box itself. Setting up DSH or a coding tool? The <a href="#connect" data-goto="connect">Connect</a> tab walks you through it.</p>
+          <p class="muted small" id="creds-hint">Your OpenClaw token and model API key, read from the box itself. Setting up Vision or a coding tool? The <a href="#connect" data-goto="connect">Connect</a> tab walks you through it.</p>
         </section>
 
         <footer class="foot">
@@ -130,21 +130,21 @@
           <p class="note slim" id="test-result" hidden></p>
         </section>
 
-        <section class="panel" id="dsh">
-          <div class="panel-head"><h2>Connect DSH (Mac or Windows)</h2></div>
+        <section class="panel" id="vision">
+          <div class="panel-head"><h2>Connect Vision (Mac or Windows)</h2></div>
           <ol class="howto">
-            <li>In DSH, open the setup wizard (or <em>Settings ▸ AI Models ▸ Add</em>) and choose <strong>My Spark Swapper</strong>.</li>
-            <li>Create a connection code here, copy it, and paste it there. DSH sets up the model, model switching and this box's security certificate in one go.</li>
+            <li>In Vision, open the setup wizard (or <em>Settings ▸ AI Models ▸ Add</em>) and choose <strong>My Spark Swapper</strong>.</li>
+            <li>Create a connection code here, copy it, and paste it there. Vision sets up the model, model switching and this box's security certificate in one go.</li>
           </ol>
           <div class="row wrap">
-            <input id="tok-label" maxlength="80" placeholder="Name it, e.g. DSH on my laptop" aria-label="Name for this connection">
+            <input id="tok-label" maxlength="80" placeholder="Name it, e.g. Vision on my laptop" aria-label="Name for this connection">
             <button class="btn primary" id="btn-code">Create connection code</button>
           </div>
           <div id="code-box" hidden>
             <label>Connection code
               <textarea id="code" readonly rows="4" spellcheck="false"></textarea>
             </label>
-            <div class="row"><button class="btn ghost small" id="btn-copy-code">Copy</button><span class="muted small">Treat it like a password: it lets DSH switch models and use the API. It's shown once; you can revoke it below.</span></div>
+            <div class="row"><button class="btn ghost small" id="btn-copy-code">Copy</button><span class="muted small">Treat it like a password: it lets Vision switch models and use the API. It's shown once; you can revoke it below.</span></div>
           </div>
           <h3 class="sub">App connections</h3>
           <table class="users" id="tok-table">
