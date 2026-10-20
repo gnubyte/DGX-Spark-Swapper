@@ -62,14 +62,81 @@ class ConfigTests(unittest.TestCase):
         for key, m in CATALOG["models"].items():
             for field in ("title", "platforms", "kind", "served_id", "context", "openclaw_provider", "perf"):
                 self.assertIn(field, m, f"{key} lacks {field}")
-            self.assertIn(m["kind"], ("sglang-docker", "flash-vllm", "recipe-script", "llamacpp"))
+            self.assertIn(m["kind"], ("docker", "sglang-docker", "flash-vllm", "recipe-script", "llamacpp"))
             if m["kind"] == "llamacpp":
                 self.assertTrue(m.get("unit", "").startswith("swapper-llama-"))
                 self.assertTrue(m["files"])
             if m["kind"] == "recipe-script":
                 self.assertTrue(m.get("container") and m.get("dir"))
+            if m["kind"] in ("docker", "sglang-docker"):
+                self.assertTrue(m.get("container") and m.get("docker_run"), f"{key} needs a container and docker_run")
         providers = [m["openclaw_provider"] for m in CATALOG["models"].values()]
         self.assertEqual(len(providers), len(set(providers)), "each model needs its own OpenClaw provider")
+
+    def test_served_ids_and_containers_are_unique_per_platform(self):
+        # Which model is "serving" is decided by the id the server reports, so two models can't share one.
+        for platform in (hardware.NVIDIA_GB10, hardware.AMD_STRIX_HALO):
+            models = config.merge(site(), CATALOG, platform)["models"]
+            ids = [m["served_id"] for m in models.values()]
+            self.assertEqual(len(ids), len(set(ids)), f"{platform}: two models share a served_id")
+            containers = [m["container"] for m in models.values() if m.get("container")]
+            self.assertEqual(len(containers), len(set(containers)), f"{platform}: two models share a container")
+
+    def test_no_placeholder_is_left_unfilled(self):
+        # {{HOME}}, {{API_KEY}} … and the catalog's snippets must all resolve once a model is rendered.
+        for platform in (hardware.NVIDIA_GB10, hardware.AMD_STRIX_HALO):
+            for key, m in config.merge(site(), CATALOG, platform)["models"].items():
+                left = re.findall(r"\{\{[A-Z_]+\}\}", json.dumps(m))
+                self.assertEqual(left, [], f"{key} still has placeholders")
+
+    def test_new_spark_recipes_are_in_the_catalog(self):
+        models = config.merge(site(), CATALOG, hardware.NVIDIA_GB10)["models"]
+        for key in ("tf27b", "tfflash", "bolt", "nemotron", "laguna", "ornith", "vllmfp4"):
+            self.assertIn(key, models)
+        bolt, flash, laguna = models["bolt"], models["tfflash"], models["laguna"]
+        self.assertEqual(bolt["kind"], "recipe-script")
+        self.assertTrue(bolt["install"]["steps"][0]["url"].endswith("/Nemotron-3.5-Bolt-TensorFold-DGX-Spark.git"))
+        self.assertTrue(bolt["dir"].endswith("Nemotron-3.5-Bolt-TensorFold-DGX-Spark"))
+        self.assertIn("TENSORFOLD_API_KEY", bolt["env"], "the TensorFold servers check the key themselves")
+        # The Flash Next recipe now serves NVIDIA's FP4 checkpoint (~81 GiB loaded, ~108 GiB to start).
+        self.assertGreaterEqual(flash["min_free_gib"], 105)
+        self.assertEqual(laguna["kind"], "docker")
+        args = laguna["docker_run"]
+        self.assertEqual(args[args.index("--host") + 1], "127.0.0.1", "the model server stays off the network")
+        self.assertIn("--api-key", args)
+        self.assertEqual(args[args.index("--max-num-seqs") + 1], "4", "DFlash crashes at vLLM's default of 256")
+        self.assertIn("--speculative-config", args)
+
+    def test_hugging_face_models_share_weights_with_the_recipes(self):
+        models = config.merge(site(), CATALOG, hardware.NVIDIA_GB10)["models"]
+        fp4 = models["vllmfp4"]
+        repo, rev = "nvidia/Qwen3.8-Flash-Next-FP4-Local", "b9ce18a6887e18c089fdea8509a33e63429a3300"
+        self.assertIn(repo, Engine.model_hf_repos(models["tfflash"]))
+        self.assertIn(repo, Engine.model_hf_repos(fp4))
+        self.assertIn({"do": "hf_snapshot", "repo": repo, "revision": rev}, fp4["install"]["steps"])
+        self.assertEqual(fp4["docker_run"][fp4["docker_run"].index("--revision") + 1], rev)
+        # one Hugging Face cache for every recipe, mounted where huggingface_hub looks
+        self.assertIn("/home/pat/.cache/huggingface:/root/.cache/huggingface", fp4["docker_run"])
+        ornith = models["ornith"]
+        self.assertEqual(Engine.model_hf_repos(ornith), ["Mia-AiLab/Ornith-1.5-122B-EXL3-EAQv1-4-bpw"])
+        self.assertTrue(ornith["experimental"])
+        self.assertFalse(ornith["template_kwargs"], "TabbyAPI isn't sent chat_template_kwargs in the speed check")
+
+    def test_profiles_and_builds_are_well_formed(self):
+        self.assertTrue(CATALOG["profiles"] and CATALOG["builds"])
+        known = {"REPO", "REPO_DIR", "SLUG", "KEY", "COMMIT", "CTX", "UTIL", "HOME", "API_KEY", "API_PORT", "USER",
+                 *CATALOG["snippets"]}
+        for name, p in CATALOG["profiles"].items():
+            for field in ("label", "platforms", "formats", "engine", "entry"):
+                self.assertIn(field, p, f"profile {name} lacks {field}")
+            for ph in re.findall(r"\{\{([A-Z_]+)\}\}", json.dumps(p["entry"])):
+                self.assertIn(ph, known, f"profile {name} uses {{{{{ph}}}}} that nothing fills in")
+            for step in p["entry"]["install"]["steps"]:
+                if step.get("build"):
+                    self.assertIn(step["build"], CATALOG["builds"])
+        for name, b in CATALOG["builds"].items():
+            self.assertTrue(b["dockerfile"][0].startswith("FROM "))
+            self.assertTrue(b["image"].startswith("swapper/"))
 
     def test_render_fills_known_placeholders_only(self):
         out = config.render({"a": "{{HOME}}/x", "b": ["{{USER}}", "{{NOPE}}"], "c": 3}, {"HOME": "/home/pat", "USER": "pat"})

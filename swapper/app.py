@@ -15,18 +15,22 @@ import hmac
 import json
 import mimetypes
 import os
+import re
 import secrets
 import ssl
 import sys
 import threading
 import time
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import engine  # noqa: E402
 import hardware  # noqa: E402
+import hfmodels  # noqa: E402
 import tokens as tokens_mod  # noqa: E402
+import storage  # noqa: E402
 from engine import Engine, NotInstalled  # noqa: E402
 from installer import Installer  # noqa: E402
 from updater import Updater  # noqa: E402
@@ -65,7 +69,8 @@ AUTH_FILE = CONF_DIR / "users.json"
 TOKENS = tokens_mod.TokenStore(CONF_DIR / "tokens.json", persist=not DEMO)
 
 # Routes an app token may not use: it acts as its user for everything else.
-TOKEN_FORBIDDEN = ("/api/users", "/api/tokens", "/api/updates", "/api/password", "/api/setup")
+TOKEN_FORBIDDEN = ("/api/users", "/api/tokens", "/api/updates", "/api/password", "/api/setup",
+                   "/api/hf", "/api/models/delete", "/api/storage")
 
 
 def _hash(password: str, salt: bytes) -> str:
@@ -363,6 +368,7 @@ class Handler(BaseHTTPRequestHandler):
             st = self.engine.status()
             job = self.engine.job
             ijob = self.installer.job
+            self.installer.storage.touch()
             upd = self.updater.info() if is_admin else None
             return self._json(200, {
                 **st,
@@ -383,6 +389,23 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/provisioning/job":
             job = self.installer.job
             return self._json(200, {"job": job.to_dict() if job else None})
+        if path == "/api/storage":
+            query = urllib.parse.parse_qs(self.path.partition("?")[2])
+            return self._json(200, {**self.installer.storage.snapshot(fresh="fresh" in query and is_admin),
+                                    "busy": bool(self.installer.job and self.installer.job.state == "running")})
+        if path == "/api/storage/plan":
+            if not is_admin:
+                return self._json(403, {"error": "Admin only."})
+            key = urllib.parse.parse_qs(self.path.partition("?")[2]).get("key", [""])[0]
+            try:
+                return self._json(200, self.installer.storage.plan_delete(key))
+            except storage.StorageError as e:
+                return self._json(404, {"error": str(e)})
+        if path == "/api/hf/token":
+            if not is_admin:
+                return self._json(403, {"error": "Admin only."})
+            _, source = self.engine.hf_token_source()
+            return self._json(200, {"set": bool(source), "source": source})
         if path == "/api/tokens":
             return self._json(200, {"tokens": TOKENS.list(None if is_admin else user["username"])})
         if path == "/api/updates":
@@ -519,6 +542,52 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/updates/settings":
             self.updater.set_settings(check=body.get("check"), auto_install=body.get("auto_install"))
             return self._json(200, self.updater.info())
+
+        if path == "/api/models/delete":
+            try:
+                job = self.installer.begin_delete(str(body.get("key", "")))
+            except ValueError:
+                return self._json(400, {"error": "Unknown model."})
+            except (RuntimeError, storage.StorageError) as e:
+                return self._json(409, {"error": str(e)})
+            return self._json(202, {"ok": True, "job": job.to_dict()})
+
+        if path == "/api/storage/remove":
+            try:
+                job = self.installer.begin_remove_other(str(body.get("kind", "")), str(body.get("name", "")))
+            except ValueError as e:
+                return self._json(400, {"error": str(e)})
+            except RuntimeError as e:
+                return self._json(409, {"error": str(e)})
+            return self._json(202, {"ok": True, "job": job.to_dict()})
+
+        if path == "/api/hf/inspect":
+            try:
+                return self._json(200, hfmodels.inspect(self.engine, str(body.get("url", ""))))
+            except hfmodels.ModelError as e:
+                return self._json(400, {"error": str(e)})
+
+        if path == "/api/hf/add":
+            try:
+                key, entry = hfmodels.build(self.engine, str(body.get("url", "")), body)
+                self.engine.add_custom_model(key, entry)
+            except (hfmodels.ModelError, ValueError) as e:
+                return self._json(400, {"error": str(e)})
+            try:
+                job = self.installer.begin(f"model:{key}", allow_infra=True)
+            except RuntimeError as e:
+                return self._json(409, {"error": f"Added {entry['title']}, but it can't install right now: {e} "
+                                                 "Press Install on its card when the other job has finished.",
+                                        "key": key, "added": True})
+            return self._json(202, {"ok": True, "key": key, "job": job.to_dict()})
+
+        if path == "/api/hf/token":
+            tok = str(body.get("token", "")).strip()
+            if tok and not re.fullmatch(r"hf_[A-Za-z0-9]{20,200}", tok):
+                return self._json(400, {"error": "That doesn't look like a Hugging Face token (it starts with hf_)."})
+            self.engine.save_state(hf_token=tok or None)
+            _, source = self.engine.hf_token_source()
+            return self._json(200, {"set": bool(source), "source": source})
 
         if path == "/api/users/add":
             with _auth_lock:

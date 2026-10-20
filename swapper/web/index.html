@@ -40,6 +40,7 @@
       <div class="brand"><span class="mark small" aria-hidden="true"></span>Spark Swapper<span class="plat" id="plat"></span></div>
       <nav class="tabs" aria-label="Sections">
         <button class="tab" data-tab="models" id="tab-models">Models</button>
+        <button class="tab" data-tab="storage" id="tab-storage">Storage</button>
         <button class="tab" data-tab="connect" id="tab-connect">Connect</button>
         <button class="tab" data-tab="provision" id="tab-provision">Provisioning</button>
         <button class="tab" data-tab="users" id="tab-users" hidden>Users</button>
@@ -64,6 +65,11 @@
             <div class="now-title" id="now-title">Checking…</div>
             <div class="muted small" id="now-sub"></div>
           </div>
+        </div>
+
+        <div class="toolbar" id="models-toolbar" hidden>
+          <span class="muted small">Want something that isn't listed? Paste a Hugging Face link and Spark Swapper sets it up.</span>
+          <button class="btn ghost small" id="btn-hf">＋ Add from Hugging Face</button>
         </div>
 
         <div class="cards" id="cards"></div>
@@ -104,10 +110,17 @@
         </section>
 
         <footer class="foot">
-          <div class="meter" title="Unified memory in use">
-            <span>Memory</span>
-            <div class="bar"><i id="mem-bar"></i></div>
-            <span id="mem-text" class="muted"></span>
+          <div class="meters">
+            <div class="meter" title="Unified memory in use">
+              <span>Memory</span>
+              <div class="bar"><i id="mem-bar"></i></div>
+              <span id="mem-text" class="muted"></span>
+            </div>
+            <a class="meter" id="disk-meter" href="#storage" data-goto="storage" title="Disk space — open the Storage tab" hidden>
+              <span>Disk</span>
+              <div class="bar"><i id="disk-bar"></i></div>
+              <span id="disk-text" class="muted"></span>
+            </a>
           </div>
           <div class="health">
             <span id="h-gpu" class="muted" hidden></span>
@@ -116,6 +129,43 @@
             <span id="h-oc" class="muted"></span>
           </div>
         </footer>
+      </div>
+
+      <!-- ── Storage tab ── -->
+      <div id="pane-storage" hidden>
+        <section class="panel">
+          <div class="panel-head">
+            <h2>Disk space</h2>
+            <button class="btn ghost small" id="btn-rescan">Measure again</button>
+          </div>
+          <div id="st-disks"></div>
+          <p class="muted small" id="st-status"></p>
+        </section>
+
+        <section class="panel" id="st-job" hidden>
+          <div class="panel-head">
+            <h2 id="st-job-title">Working</h2>
+            <span class="muted small" id="st-job-time"></span>
+          </div>
+          <ol class="steps" id="st-job-steps"></ol>
+          <p class="note" id="st-job-note" hidden></p>
+          <details id="st-job-log-wrap">
+            <summary>Details</summary>
+            <pre id="st-job-log" class="log"></pre>
+          </details>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head"><h2>What each model takes</h2></div>
+          <p class="muted small">Weights, the engine's image, the recipe and its caches. Weights and images that two models share are counted for both but only removed when the last model that uses them goes — "Free up" says how much deleting a model really gives back.</p>
+          <div id="st-models"></div>
+        </section>
+
+        <section class="panel" id="st-other-panel" hidden>
+          <div class="panel-head"><h2>Other things on the disk</h2></div>
+          <p class="muted small">Left behind by older installs, or nothing in the model list accounts for them. Remove what you don't need.</p>
+          <div id="st-other"></div>
+        </section>
       </div>
 
       <!-- ── Connect tab ── -->
@@ -231,6 +281,16 @@
           <details id="upd-log-wrap"><summary>Update log</summary><pre class="log" id="upd-log"></pre></details>
         </section>
         <section class="panel">
+          <div class="panel-head"><h2>Hugging Face</h2></div>
+          <p class="muted small">Only needed for models that ask you to accept their terms first (gated models). Create a token at huggingface.co/settings/tokens with <em>read</em> access; it is kept on this box and sent only to huggingface.co.</p>
+          <p id="hf-token-status" class="small"></p>
+          <div class="row wrap">
+            <input id="hf-token" type="password" autocomplete="off" spellcheck="false" placeholder="hf_…" aria-label="Hugging Face token">
+            <button class="btn ghost" id="btn-hf-token">Save</button>
+            <button class="btn ghost danger" id="btn-hf-token-clear" hidden>Remove</button>
+          </div>
+        </section>
+        <section class="panel">
           <div class="panel-head"><h2>This box</h2></div>
           <div id="about"></div>
         </section>
@@ -246,6 +306,37 @@
       <div class="row end">
         <button class="btn ghost" value="cancel">Not now</button>
         <button class="btn primary" value="ok" id="confirm-ok">Confirm</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="del" class="wide">
+    <form method="dialog">
+      <h3 id="del-title"></h3>
+      <div id="del-blockers"></div>
+      <p class="muted small" id="del-intro"></p>
+      <div id="del-remove"></div>
+      <div id="del-keep"></div>
+      <div class="row end">
+        <button class="btn ghost" value="cancel">Keep it</button>
+        <button class="btn primary danger-fill" value="ok" id="del-ok">Delete</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="hf" class="wide">
+    <form id="hf-form" method="dialog">
+      <h3>Add a model from Hugging Face</h3>
+      <p class="muted small">Paste a model's link (or <code>owner/name</code>). Spark Swapper looks it up, checks that this box can run it, downloads it into the shared Hugging Face cache and sets up the engine. Only models in a format it knows how to run are accepted.</p>
+      <div class="row wrap">
+        <input id="hf-url" placeholder="https://huggingface.co/owner/model" autocomplete="off" spellcheck="false" aria-label="Hugging Face model link">
+        <button class="btn ghost" id="hf-look" type="button">Look it up</button>
+      </div>
+      <p id="hf-err" class="err" role="alert"></p>
+      <div id="hf-result"></div>
+      <div class="row end">
+        <button class="btn ghost" value="cancel" formnovalidate>Close</button>
+        <button class="btn primary" id="hf-add" value="ok" hidden>Add and install</button>
       </div>
     </form>
   </dialog>

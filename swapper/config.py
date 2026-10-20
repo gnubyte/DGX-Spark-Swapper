@@ -65,11 +65,19 @@ def load_json(path: Path, default=None):
         return default
 
 
-def merge(site: dict, catalog: dict, platform: str) -> dict:
+def merge(site: dict, catalog: dict, platform: str, custom: dict | None = None) -> dict:
     """The effective config: the site config with "models" and "recipes"
     replaced by catalog ⊕ site for this platform. Models carry a "source" field
-    ("catalog", "site" or "catalog+site") so the UI can say where they came from."""
+    ("catalog", "site", "catalog+site" or "custom") so the UI can say where they
+    came from. `custom` holds the models added from Hugging Face on the page; a
+    catalog or site model with the same key always wins over one of them."""
     values = site_values(site)
+    # "snippets": text the catalog's entries share ({{NAME}} in a string becomes the snippet), e.g. the
+    # script that starts TabbyAPI inside its container.
+    snippets = {k: "\n".join(v) if isinstance(v, list) else v
+                for k, v in ((catalog or {}).get("snippets") or {}).items()
+                if re.fullmatch(r"[A-Z_]+", k) and isinstance(v, (str, list))}
+    values = {**snippets, **values}
     cat_models = render((catalog or {}).get("models") or {}, values)
     cat_recipes = render((catalog or {}).get("recipes") or {}, values)
     site_models = strip_legacy(site.get("models") or {}, values, load_json(LEGACY_V1, {}))
@@ -87,6 +95,10 @@ def merge(site: dict, catalog: dict, platform: str) -> dict:
         if key in hidden or key in cat_models:
             continue
         models[key] = {**m, "source": "site"}
+    for key, m in render(custom or {}, values).items():
+        if key in hidden or key in models or not isinstance(m, dict):
+            continue
+        models[key] = {**m, "source": "custom"}
 
     # A model without "platforms" (an old site entry) runs anywhere.
     models = {k: m for k, m in models.items() if platform in (m.get("platforms") or [platform])}
@@ -96,6 +108,8 @@ def merge(site: dict, catalog: dict, platform: str) -> dict:
     out = {k: v for k, v in site.items() if k not in ("models", "recipes")}
     out["models"] = models
     out["recipes"] = {**cat_recipes, **(site.get("recipes") or {})}
+    out["profiles"] = (catalog or {}).get("profiles") or {}   # engine templates for "Add from Hugging Face"
+    out["builds"] = (catalog or {}).get("builds") or {}       # Dockerfiles for images built on the box
     out["catalog_version"] = (catalog or {}).get("catalog_version", 1)
     return out
 
@@ -123,6 +137,6 @@ def load_site(site_path: Path) -> dict:
     return site
 
 
-def load(site_path: Path, catalog_path: Path, platform: str) -> dict:
+def load(site_path: Path, catalog_path: Path, platform: str, custom: dict | None = None) -> dict:
     catalog = load_json(catalog_path, {}) or {}
-    return merge(load_site(site_path), catalog, platform)
+    return merge(load_site(site_path), catalog, platform, custom)

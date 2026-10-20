@@ -2,7 +2,9 @@
 and how to repoint OpenClaw at whichever one is live.
 
 Model kinds:
-  sglang-docker   one docker container kept between runs (docker start/stop)
+  docker          one docker container kept between runs (docker start/stop), made
+                  from the entry's docker_run arguments: vLLM, SGLang, TabbyAPI …
+  sglang-docker   the same, under the name the first catalog entry used
   flash-vllm      the original Flash Next recipe's start.sh / stop.sh, run as root
   recipe-script   a recipe whose start.sh / stop.sh run one docker container, run
                   as the box's user (TensorFold 27B and Flash Next, Nemotron)
@@ -18,6 +20,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import signal
 import socket
 import ssl
@@ -31,6 +34,7 @@ from collections import deque
 from pathlib import Path
 
 import config as config_mod
+import fetch
 import hardware
 
 ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
@@ -40,6 +44,7 @@ DEFAULT_STATE = Path("/var/lib/spark-swapper")
 FRONT_CONF = Path("/etc/nginx/conf.d/spark-model-front.conf")
 FRONT_MARK = "# Written by Spark Swapper"
 _SECRETISH = re.compile(r"KEY|TOKEN|SECRET|PASSWORD", re.I)
+DOCKER_KINDS = ("docker", "sglang-docker")
 
 
 def key_digest(key: str) -> str:
@@ -157,6 +162,9 @@ STEP_LABELS = {
     "requires": "Checking what it needs",
     "fetch": "Downloading and setting up",
     "check": "Checking it's ready",
+    "scan": "Working out what it uses",
+    "remove": "Removing it",
+    "refresh": "Updating the page, the disk figures and OpenClaw",
 }
 
 
@@ -232,6 +240,7 @@ class Engine:
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.version = app_version()
         site = config_mod.load_site(self.config_path)   # a broken config stops here, loudly
+        self._site = site                               # reloads reuse it: edits to the file apply on restart
         # Model weights and llama.cpp builds live outside the 0700 state dir so a
         # sandboxed (unprivileged) llama-server can read them.
         self.runtime_dir = Path(os.environ.get("SWAPPER_RUNTIME") or (
@@ -241,13 +250,17 @@ class Engine:
             self.platform_evidence = "demo"
         else:
             self.platform, self.platform_evidence = hardware.detect(sh, site.get("platform"))
-        self.cfg = config_mod.merge(site, config_mod.load_json(self.catalog_path, {}) or {}, self.platform)
+        self.cfg = config_mod.merge(site, config_mod.load_json(self.catalog_path, {}) or {}, self.platform,
+                                    self.load_custom())
         self.job: Job | None = None
         self._swap_lock = threading.Lock()
         self._state_lock = threading.Lock()
         self._status_cache: tuple[float, dict] | None = None
         self._install_cache: dict[str, tuple[float, dict]] = {}
         self._mtp_cache: dict[str, bool] = {}
+        self.disk_sizes: dict[str, int] = {}   # bytes each installed model takes, filled in by storage.Storage
+        self.deleting: str | None = None       # the model being deleted: it can't be switched to meanwhile
+        self._demo_removed: set[str] = set()   # demo mode only: models "deleted" in this run
 
     # ── persistent state ──
     @property
@@ -277,6 +290,121 @@ class Engine:
             tmp.write_text(json.dumps(st, indent=2))
             tmp.replace(self._state_file)
             return st[key]
+
+    # ── models added from Hugging Face on the page ──
+    @property
+    def custom_file(self) -> Path:
+        return self.state_dir / "custom_models.json"
+
+    def load_custom(self) -> dict:
+        d = config_mod.load_json(self.custom_file, {})
+        return d if isinstance(d, dict) else {}
+
+    def _save_custom(self, models: dict):
+        tmp = self.custom_file.with_suffix(".tmp")
+        tmp.write_text(json.dumps(models, indent=2))
+        tmp.replace(self.custom_file)
+
+    def _merged(self, custom: dict) -> dict:
+        """The effective config for `custom` models, from the site config this process started with (so a
+        half-edited file, or a changed API key, never takes effect behind a running Swapper's back)."""
+        return config_mod.merge(self._site, config_mod.load_json(self.catalog_path, {}) or {}, self.platform, custom)
+
+    def _apply(self, new: dict):
+        """Swap a new config in. The installer and the storage scanner keep a reference to `self.cfg`, so it is
+        updated in place, a key at a time (never cleared first): request threads read self.cfg["models"]."""
+        for k in [k for k in self.cfg if k not in new]:
+            del self.cfg[k]
+        self.cfg.update(new)
+        self.forget_install_cache()
+
+    def reload_models(self):
+        self._apply(self._merged(self.load_custom()))
+
+    def add_custom_model(self, key: str, entry: dict):
+        if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", key):
+            raise ValueError("bad model key")
+        if key in self.models and self.models[key].get("source") != "custom":
+            raise ValueError(f"{key} is already a catalog model")
+        with self._state_lock:
+            custom = self.load_custom()
+            custom[key] = entry
+            new = self._merged(custom)       # can fail: nothing is written until it has worked
+            self._save_custom(custom)
+        self._apply(new)
+
+    def remove_custom_model(self, key: str):
+        with self._state_lock:
+            custom = self.load_custom()
+            if custom.pop(key, None) is None:
+                return
+            new = self._merged(custom)
+            self._save_custom(custom)
+        self._apply(new)
+
+    # ── Hugging Face cache ──
+    def hf_hubs(self) -> list[Path]:
+        """The Hugging Face caches models may be in: the box user's first (recipes run as that
+        user), then root's (the original Flash recipe runs as root), then $HF_HOME."""
+        hubs = []
+        for h in (self.home, "/root"):
+            p = Path(h) / ".cache/huggingface/hub"
+            if p not in hubs:
+                hubs.append(p)
+        if os.environ.get("HF_HOME"):
+            p = Path(os.environ["HF_HOME"]) / "hub"
+            if p not in hubs:
+                hubs.append(p)
+        return hubs
+
+    def hf_hub(self) -> Path:
+        """Where the Swapper downloads to: the box user's cache, which every recipe reads."""
+        return Path(self.home) / ".cache/huggingface/hub"
+
+    def hf_status(self, repo: str, revision: str | None = None, home: str | None = None) -> dict:
+        """Is `repo` fully downloaded? In the cache of `home`, or — by default — the box user's: the one
+        the containers mount and the recipes read. (A copy under /root or $HF_HOME isn't theirs.)"""
+        hubs = [Path(home) / ".cache/huggingface/hub"] if home else [self.hf_hub()]
+        best = None
+        for hub in hubs:
+            st = fetch.hf_snapshot_status(hub, repo, revision)
+            st["hub"] = str(hub)
+            if st["complete"]:
+                return st
+            if best is None or (st["present"] and not best["present"]):
+                best = st
+        return best or {"present": False, "complete": False, "detail": f"{repo} isn't downloaded"}
+
+    def hf_token_source(self) -> tuple[str | None, str | None]:
+        """(token, where it came from): the one saved on the Settings tab, else the site config's
+        "hf_token", the service's HF_TOKEN, or the box user's own `hf auth login`."""
+        for source, tok in (("settings", self.load_state().get("hf_token")), ("config", self.cfg.get("hf_token")),
+                            ("environment", os.environ.get("HF_TOKEN"))):
+            if tok:
+                return str(tok), source
+        for rel in (".cache/huggingface/token", ".huggingface/token"):
+            try:
+                tok = (Path(self.home) / rel).read_text().strip()
+            except OSError:
+                continue
+            if tok:
+                return tok, "the box user's Hugging Face login"
+        return None, None
+
+    def hf_token(self) -> str | None:
+        return self.hf_token_source()[0]
+
+    def box_owner(self) -> tuple[int, int] | None:
+        """(uid, gid) of the box's user when the Swapper runs as root: files it puts in that
+        user's home are handed to them, so the recipes (which run as them) can use them."""
+        if self.user == "root" or not hasattr(os, "geteuid") or os.geteuid() != 0:
+            return None
+        try:
+            import pwd
+            pw = pwd.getpwnam(self.user)
+        except (KeyError, ImportError):
+            return None
+        return pw.pw_uid, pw.pw_gid
 
     @property
     def models(self) -> dict:
@@ -435,6 +563,9 @@ class Engine:
             snaps = Path(home) / ".cache/huggingface/hub" / f"models--{repo.replace('/', '--')}" / "snapshots"
             ok = any(p.is_dir() for p in snaps.glob("*")) if snaps.is_dir() else False
             return ok, "" if ok else f"{repo} not downloaded"
+        if "hf_snapshot" in check:
+            st = self.hf_status(check["hf_snapshot"], check.get("revision"), check.get("home"))
+            return bool(st["complete"]), "" if st["complete"] else st["detail"]
         if "docker_image_or_container" in check:
             ok = self.image_exists(check["docker_image_or_container"]) or \
                  (bool(check.get("container")) and self.container_exists(check["container"]))
@@ -456,13 +587,15 @@ class Engine:
             return hit[1]
         m = self.models[key]
         if DEMO:
-            demo_missing = {"nemotron", "halo27b-q8", "haloflash", "flash"}
+            demo_missing = {"nemotron", "halo27b-q8", "haloflash", "flash", "bolt", "laguna", "ornith",
+                            "vllmfp4"} | self._demo_removed | {k for k, x in self.models.items()
+                                                               if x.get("source") == "custom"}
             st = {"installed": key not in demo_missing, "detail": "" if key not in demo_missing else "not downloaded"}
         elif m["kind"] == "flash-vllm":
             d = Path(m.get("dir", ""))
             ok = (d / "start.sh").is_file() and (d / ".env").is_file()
             st = {"installed": ok, "detail": "" if ok else f"recipe not at {d}"}
-        elif m["kind"] == "sglang-docker" and not (m.get("install") or {}).get("ready"):
+        elif m["kind"] in DOCKER_KINDS and not (m.get("install") or {}).get("ready"):
             st = {"installed": True, "detail": ""}
         else:
             results = [self._ready(m, c) for c in (m.get("install") or {}).get("ready", [])]
@@ -514,7 +647,27 @@ class Engine:
             "eta": m.get("eta"),
             "repo": m.get("repo"),
             "anthropic_api": bool(m.get("anthropic_api")),
+            "experimental": bool(m.get("experimental")),
+            "custom": m.get("source") == "custom",
+            "hf_repos": self.model_hf_repos(m),
+            "disk_bytes": self.disk_sizes.get(key),
+            "notes": m.get("notes") or [],
         }
+
+    @staticmethod
+    def model_hf_repos(m: dict) -> list[str]:
+        """The Hugging Face repos whose files this model runs from (in the shared HF cache)."""
+        repos: list[str] = []
+        inst = m.get("install") or {}
+        for step in inst.get("steps", []):
+            if step.get("do") == "hf_snapshot" and step.get("repo"):
+                repos.append(step["repo"])
+        for check in inst.get("ready", []):
+            for k in ("hf_snapshot", "hf_cached"):
+                if check.get(k):
+                    repos.append(check[k])
+        repos += (m.get("footprint") or {}).get("hf", [])
+        return list(dict.fromkeys(repos))
 
     def status(self, fresh: bool = False) -> dict:
         now = time.time()
@@ -534,13 +687,16 @@ class Engine:
             served = self.served()
         models = {}
         active = None
-        for key, m in self.models.items():
-            is_running = self.model_running(key, containers, units)
-            healthy = self.serves(m, served)
-            if healthy:
-                active = key
-                is_running = True
-            models[key] = self.model_summary(key, m, is_running, healthy, served, measured)
+        for key, m in list(self.models.items()):
+            try:
+                is_running = self.model_running(key, containers, units)
+                healthy = self.serves(m, served)
+                if healthy:
+                    active = key
+                    is_running = True
+                models[key] = self.model_summary(key, m, is_running, healthy, served, measured)
+            except KeyError:        # a model added from Hugging Face was removed while this poll ran
+                continue
         loading = [k for k, v in models.items() if v["running"] and not v["healthy"]]
         out = {
             "active": active,
@@ -559,11 +715,25 @@ class Engine:
             "platform": self.platform,
             "platform_label": hardware.label(self.platform),
             "hostname": self.hostname(),
+            "disk": self.disk_summary(),
         }
         if self.platform == hardware.AMD_STRIX_HALO:
             out["gpu"] = {"vram_gib": 0.5, "gtt_gib": 108.0, "total_gib": 108.5} if DEMO else hardware.amd_gpu_memory()
         self._status_cache = (now, out)
         return out
+
+    def disk_summary(self) -> dict | None:
+        """Total and free bytes of the disk the models' downloads go to (the Hugging Face cache's)."""
+        if DEMO:
+            return {"total": 3_840_000_000_000, "free": 1_880_000_000_000}
+        p = self.hf_hub()
+        while not p.exists() and p != p.parent:
+            p = p.parent
+        try:
+            u = shutil.disk_usage(p)
+        except OSError:
+            return None
+        return {"total": u.total, "free": u.free}
 
     # ── OpenClaw ──
     def _oc_env(self) -> dict:
@@ -597,6 +767,14 @@ class Engine:
     def openclaw_primary(self) -> str | None:
         return (((self.openclaw_config().get("agents") or {}).get("defaults") or {})
                 .get("model") or {}).get("primary")
+
+    def openclaw_refs(self) -> list[str]:
+        """Every model reference OpenClaw's defaults point at: main, image, compaction and memory-flush."""
+        d = (self.openclaw_config().get("agents") or {}).get("defaults") or {}
+        comp = d.get("compaction") or {}
+        refs = [(d.get("model") or {}).get("primary"), d.get("imageModel"), comp.get("model"),
+                (comp.get("memoryFlush") or {}).get("model")]
+        return [r for r in refs if isinstance(r, str)]
 
     def openclaw_ref(self, key: str) -> str:
         m = self.models[key]
@@ -712,7 +890,7 @@ class Engine:
     def stop_model(self, key: str, job: Job):
         m = self.models[key]
         kind = m["kind"]
-        if kind == "sglang-docker":
+        if kind in DOCKER_KINDS:
             # Keep the container (fast restart) but stop docker from reviving it at boot.
             sh(["docker", "update", "--restart", "no", m["container"]], timeout=20)
             job.say(f"docker stop {m['container']} (up to 60s for a clean shutdown)")
@@ -800,7 +978,7 @@ class Engine:
                 raise SwapFailed(f"Flash recipe not found at {d} (need start.sh and .env).")
             if not self._checkpoint_home(m):
                 raise SwapFailed(f"Flash checkpoint {m['checkpoint']} is not in any Hugging Face cache. Run download.sh first.")
-        elif kind == "sglang-docker":
+        elif kind in DOCKER_KINDS:
             if not self.container_exists(m["container"]):
                 job.say(f"Container {m['container']} is missing — it will be recreated from the saved recipe.")
         elif kind == "recipe-script":
@@ -855,7 +1033,7 @@ class Engine:
         m = self.models[key]
         timeout = m.get("start_timeout_s", 1800)
         kind = m["kind"]
-        if kind == "sglang-docker":
+        if kind in DOCKER_KINDS:
             exists = self.container_exists(m["container"])
             if exists and not self.container_current(m):
                 job.say(f"{m['container']} was created with other settings (API key, port or arguments); "
@@ -1015,6 +1193,11 @@ class Engine:
                         + (f"  {tail[-160:]}" if tail else ""))
             time.sleep(3)
 
+    @staticmethod
+    def _chat_extras(m: dict) -> dict:
+        """Ask for a plain, non-thinking reply in the speed check — unless the engine refuses the field."""
+        return {"chat_template_kwargs": {"enable_thinking": False}} if m.get("template_kwargs", True) else {}
+
     def measure(self, key: str, job: Job | None = None, usage: bool = True) -> dict | None:
         """Stream one ~256-token reply and time it: decode tokens per second after
         the first token. Returns {"decode", "ttft", "tokens", "reply"} or None when
@@ -1024,7 +1207,7 @@ class Engine:
         body = {"model": m["served_id"], "max_tokens": 256, "temperature": 0, "stream": True,
                 "messages": [{"role": "user", "content":
                               "In one paragraph of about 150 words, explain why the sky is blue."}],
-                "chat_template_kwargs": {"enable_thinking": False}}
+                **self._chat_extras(m)}
         if usage:
             body["stream_options"] = {"include_usage": True}
         req = urllib.request.Request(f"http://127.0.0.1:{self.api_port}/v1/chat/completions",
@@ -1088,16 +1271,18 @@ class Engine:
         # some engines); warm up so the speed shown is the one you'll get.
         http_json(f"http://127.0.0.1:{self.api_port}/v1/chat/completions", self.key, timeout=120,
                   body={"model": m["served_id"], "max_tokens": 16, "temperature": 0,
-                        "messages": [{"role": "user", "content": "Say hello."}],
-                        "chat_template_kwargs": {"enable_thinking": False}})
+                        "messages": [{"role": "user", "content": "Say hello."}], **self._chat_extras(m)})
         result = self.measure(key, job) or self.measure(key, job, usage=False)
         if not result or not result.get("tokens"):
             # Some servers don't stream the way the speed check expects; a plain
-            # request still proves the model answers.
+            # request still proves the model answers (and one that refuses
+            # chat_template_kwargs gets it without).
             body = {"model": m["served_id"], "max_tokens": 24, "temperature": 0,
-                    "messages": [{"role": "user", "content": "Reply with exactly: ready"}],
-                    "chat_template_kwargs": {"enable_thinking": False}}
-            r = http_json(f"http://127.0.0.1:{self.api_port}/v1/chat/completions", self.key, timeout=180, body=body)
+                    "messages": [{"role": "user", "content": "Reply with exactly: ready"}]}
+            url = f"http://127.0.0.1:{self.api_port}/v1/chat/completions"
+            r = http_json(url, self.key, timeout=180, body={**body, **self._chat_extras(m)})
+            if not (r and r.get("choices")) and m.get("template_kwargs", True):
+                r = http_json(url, self.key, timeout=180, body=body)
             if not (r and r.get("choices")):
                 raise SwapFailed("The model is up but did not answer a test prompt.")
             txt = (r["choices"][0].get("message") or {}).get("content") or ""
@@ -1120,6 +1305,8 @@ class Engine:
             raise ValueError("unknown model")
         if self.updating():
             raise RuntimeError("Spark Swapper is updating itself — try again in a minute.")
+        if self.deleting == target:
+            raise RuntimeError(f"{self.models[target]['title']} is being deleted.")
         if not self.install_state(target, fresh=True)["installed"]:
             raise NotInstalled(f"{self.models[target]['title']} isn't installed yet. Install it first.")
         if not self._swap_lock.acquire(blocking=False):

@@ -33,6 +33,21 @@ no npm on the host.
   (`agents.defaults.model.primary`, image, compaction and memory-flush models, via
   `openclaw config patch`, then restarts the gateway). If the new model fails to load,
   the previous one is brought back automatically.
+- **＋ Add from Hugging Face** (admin): paste a model's link. Spark Swapper looks the repo
+  up, says whether this box can run it (format, size, memory, disk) and with which engine,
+  then downloads it into the shared Hugging Face cache and sets the engine up — a card
+  appears and **Switch to this** works like any other. See [Adding models from Hugging
+  Face](#adding-models-from-hugging-face).
+- **Delete…** (admin): takes a model off the box and frees its disk — container, weights,
+  engine image, recipe checkout, kernel caches, measured speed, its OpenClaw provider
+  entry — after showing exactly what goes and what stays because another installed model
+  uses it.
+
+**Storage tab** — how full the disk is (with the models' share of it), what each model
+takes (weights, image, recipe, caches — expandable), how much deleting it would really give
+back, and a list of **other things on the disk** that no model accounts for (old
+checkpoints, unused docker images, docker's build cache) with a button to remove each.
+Every model card also shows its size on disk, and the Models tab footer a disk meter.
 
 **Connect tab** — everything another app needs: the OpenAI-compatible base URL, API
 key and current model ID (with a **Test** button), **connection codes for Vision**,
@@ -55,7 +70,8 @@ hardware:
 
 **Users tab** (admin) — add users, reset passwords, remove accounts.
 
-**Settings tab** (admin) — updates (see below) and what this box is.
+**Settings tab** (admin) — updates (see below), a Hugging Face token for gated models, and
+what this box is.
 
 ---
 
@@ -70,14 +86,32 @@ measures every model on your box when it loads it, and shows that next to these.
 | Model | Recipe | Context | Speed |
 |---|---|---:|---|
 | **Qwen3.8 27B** (TensorFold, DFlash2) | [MiaAI-Lab/Qwen3.8-27B-DGX-Spark-TensorFold](https://github.com/MiaAI-Lab/Qwen3.8-27B-DGX-Spark-TensorFold) | 262,144 | 58.3 prose · 136.9 code · 220.6 across 8 |
-| **Qwen3.8 Flash Next** (TensorFold, MTP) | [MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold) | 262,144 | 64.4 prose · 200.9 across 8 |
+| **Qwen3.8 Flash Next** (TensorFold Zig engine, NVIDIA FP4, MTP) | [MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold) | 262,144 | 49.8 prose · 50.9 code · 198.2 across 5 (prefill ≈2,400/s) |
+| **Nemotron 3.5 Bolt** 74B-A9B (TensorFold Zig engine, IQ2_XXS + NVFP4, LiLiCorr drafts) | [MiaAI-Lab/Nemotron-3.5-Bolt-TensorFold-DGX-Spark](https://github.com/MiaAI-Lab/Nemotron-3.5-Bolt-TensorFold-DGX-Spark) | 262,144 | 73.7 prose · 137.3 code · 240.3 across 8 · 16 streams, 23 GB of weights |
 | **Nemotron 3.5 Lightning** 30B-A3B (SGLang, DSpark) | [MiaAI-Lab/Nemotron3.5-Lightning-DGX-Spark-RTX-5090-6000-PRO](https://github.com/MiaAI-Lab/Nemotron3.5-Lightning-DGX-Spark-RTX-5090-6000-PRO) | 1,048,576 | ≈124 · ≈355 across 8 (community measurement with vLLM; the recipe publishes none) |
+| **Laguna S 2.1** 118B (vLLM 0.25.1, NVFP4, DFlash) | [MiaAI-Lab/Laguna-S-2.1-DGX-Spark-RTX-6000-PRO](https://github.com/MiaAI-Lab/Laguna-S-2.1-DGX-Spark-RTX-6000-PRO) | 262,144 | 76.7 · 139.6 across 4 (the recipe's chart) |
+| Ornith 1.5 122B EXL3 4-bit (ExLlamaV3 + TabbyAPI) — *experimental* | [Mia-AiLab/Ornith-1.5-122B-EXL3-EAQv1-4-bpw](https://huggingface.co/Mia-AiLab/Ornith-1.5-122B-EXL3-EAQv1-4-bpw) | 131,072 (262,144 native) | not published — measured on your box |
+| Qwen3.8 Flash Next, NVIDIA FP4 (vLLM b12x) | [nvidia/Qwen3.8-Flash-Next-FP4-Local](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-FP4-Local) | 262,144 | not published — measured on your box; shares its weights with the TensorFold recipe |
 | Qwen3.8 27B (SGLang, EAGLE) | [MiaAI-Lab/Qwen3.8-27B-SGLang-DGX-Spark](https://github.com/MiaAI-Lab/Qwen3.8-27B-SGLang-DGX-Spark) | 1,000,000 | 24.2 code · ~18 prose |
 | Qwen3.8 Flash Next (vLLM) — *superseded by the TensorFold recipe* | [MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark) | 524,288 | 48.7 · 162.9 across 8 |
 
+Flash Next's TensorFold recipe moved to NVIDIA's quantization-aware-distilled FP4
+checkpoint (GPQA Diamond 91.5 % against 92.2 % for bf16) on a new Zig engine: prefill is
+13–15 % faster than before and the checkpoint is closer to full precision, but single-stream
+decode is about 50 tok/s rather than the 64 the earlier INT4 build showed, and a start needs
+about 108 GiB free (it loads ~81 GiB) and ~160 GB of disk. Spark Swapper measures every model on
+your box when it loads it and shows that next to the published figure.
+
 The TensorFold and Nemotron recipes run as the box's user (who is added to the
 `docker` group), bound to `127.0.0.1`; other machines reach them through the HTTPS
-front, which checks the API key — those servers have no key of their own.
+front, which checks the API key. The TensorFold Flash Next and Bolt servers also check it
+themselves (`TENSORFOLD_API_KEY`); the 27B and Lightning ones have no key of their own.
+The vLLM and TabbyAPI models are containers Spark Swapper creates itself, with
+`--api-key`, bound to `127.0.0.1`.
+
+Weights live in the shared Hugging Face cache (`~/.cache/huggingface/hub`), so two models
+that use the same checkpoint — the Flash Next recipe and the vLLM FP4 card — take the disk
+space once, and **Delete** keeps a checkpoint while another installed model still uses it.
 
 ### Strix Halo (AMD Ryzen AI Max+ 395, 128 GB)
 
@@ -113,6 +147,53 @@ brings new models to boxes installed long ago. To change one on a single box, ad
 entry with the same key under `"models"` in `/etc/spark-swapper/models.json`: its
 fields are merged over the catalog's (yours win). `"hidden_models"` hides catalog
 models; `"platform"` forces `nvidia-gb10` or `amd-strix-halo` instead of detecting it.
+
+A catalog entry's `kind` says how it runs: `recipe-script` (a recipe's `start.sh` /
+`stop.sh`), `docker` (a container Spark Swapper creates from the entry's `docker_run`
+arguments: vLLM, SGLang, TabbyAPI), `llamacpp` (Strix Halo) or the legacy `flash-vllm` /
+`sglang-docker`. Install steps include `git`, `run`, `docker_pull`, `docker_build` (an image
+built from a Dockerfile held in the catalog's `builds`), `hf_snapshot` (a whole repo into the
+Hugging Face cache, resumable and checksummed), `hf_files` (GGUF files), `mkdirs`. An entry's
+`footprint` lists what it leaves on the disk beyond what its steps make, so **Storage** can
+measure it and **Delete** can remove it.
+
+### Adding models from Hugging Face
+
+Models ▸ **＋ Add from Hugging Face** (admin) takes a link or `owner/name`. It asks
+Hugging Face what the repo is and decides how to run it from its format:
+
+| The repo is | On a | Runs with |
+|---|---|---|
+| safetensors weights (`config.json` + `*.safetensors`) | DGX Spark | vLLM, from the community Spark image (`eugr/spark-vllm-b12x`, pinned) |
+| EXL3 (tags `exl3`, `quantization_config.quant_method: exl3`) | DGX Spark | ExLlamaV3 behind TabbyAPI, in an image built on the box |
+| GGUF | Strix Halo | llama.cpp (Vulkan), like the built-in GGUF models |
+
+It shows the size, the model's own context limit, the license, whether the box has the memory
+and disk for it, and warnings (gated, brand-new architecture); you choose the card's name, the
+context window (default 64K or the model's limit if smaller), the GGUF file where there are
+several, and — for vLLM — extra `vllm serve` arguments (split like a shell would, never run
+through one) and *trust remote code*. The model is pinned to the commit you looked at. A repo
+that one of the catalog's models already covers (both Hugging Face links in the table above) is
+recognised and offered as that card instead. Other formats are refused with the reason.
+Models added this way are marked *experimental* and kept in `/var/lib/spark-swapper/custom_models.json`;
+Delete removes them completely.
+
+Gated models need you to accept their terms on huggingface.co and a token with read access,
+saved on **Settings ▸ Hugging Face** (or `"hf_token"` in the site config, `HF_TOKEN`, or the box
+user's own `hf auth login`). The token is sent to huggingface.co only — never along to the CDN
+Hugging Face redirects file downloads to.
+
+### Disk space and deleting models
+
+**Storage** measures in the background (and on **Measure again**): the disks the models, the
+Hugging Face cache and docker use, and for each model its recipe checkout, weights, engine
+image(s) and caches. A thing two models use is shown under both and only deleted with the last
+installed model that uses it; the **Free up N GB** on a model is what deleting it really gives
+back. **Delete** refuses the model that is serving, and removes only things inside the box
+user's home, the Hugging Face cache and the Swapper's download folder — never the cache
+folders themselves, never anything a link points at. **Other things on the disk** lists
+checkpoints and images that no model accounts for (such as the INT4 Flash Next checkpoint
+older recipes left) so they can be cleaned up too.
 
 ---
 
@@ -203,7 +284,10 @@ The code is `SSC1:` + base64url (no padding) of JSON:
 App tokens go in `Authorization: Bearer sst_…` on any `/api/*` call a signed-in user can
 make, except managing users, tokens, passwords and updates. Useful endpoints:
 `GET /api/status` (models with `installed`, `perf`, `measured`, `context`),
-`POST /api/swap {"target": key}`, `GET /api/connect`, `POST /api/models/install {"key": …}`.
+`POST /api/swap {"target": key}`, `GET /api/connect`, `POST /api/models/install {"key": …}`,
+Everything about storage (`/api/storage`), deleting models, adding one from Hugging Face and the
+Hugging Face token needs a signed-in browser session — app tokens are refused, and the changes
+are admin-only.
 
 **Anything OpenAI-compatible:** base URL `https://<box>:11443/v1`, the API key, and the
 model ID — the Connect tab has copy-paste setups for common tools.
@@ -298,7 +382,13 @@ check its fingerprint against the one the Connect tab shows
   an update replaces a front written by the Windows app's own Spark guide with one that
   checks the key.
 - Downloads (weights, llama.cpp, updates) are verified against published SHA-256s
-  before use; archives are unpacked with path checks.
+  before use; archives are unpacked with path checks. Hugging Face file names that would
+  leave their folder are refused, and the Hugging Face token is not carried to the CDN
+  that serves the files.
+- Adding a model from a link, deleting models and removing leftovers are admin-only and not
+  available to app connections. A link is parsed strictly (`owner/name`, never a path or a
+  shell fragment); an added model can only use the catalog's engine templates, and what an admin
+  types as extra arguments is passed as plain arguments, not through a shell.
 - Strict CSP (no inline scripts), TLS 1.2+ only, `X-Frame-Options: DENY`.
 - **The first visitor creates the admin login, so open the page yourself right
   after installing** — anyone else on the LAN could claim it.
@@ -315,7 +405,9 @@ check its fingerprint against the one the Connect tab shows
 - `swapper/engine.py` — the swap engine (stop/start/verify/measure models, repoint
   OpenClaw, boot reconcile).
 - `swapper/installer.py` — provisioning: presence detection, infrastructure installs,
-  model installs.
+  model installs (and the delete jobs).
+- `swapper/storage.py` — disk usage, what each model takes, safe deletion.
+- `swapper/hfmodels.py` — Add from Hugging Face: inspect a repo, build a model entry from a profile.
 - `swapper/updater.py` — the weekly update check and self-install.
 - `swapper/hardware.py`, `config.py`, `fetch.py`, `tokens.py` — platform detection,
   config merging, verified downloads, app tokens.

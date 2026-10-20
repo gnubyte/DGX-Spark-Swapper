@@ -1,7 +1,7 @@
 {
-  "_comment": "The model catalog shipped with each Spark Swapper release. Every entry names the platforms it runs on, how to install it, how to start/stop it and the speeds its recipe publishes. {{USER}} and {{HOME}} are filled in from the site config (/etc/spark-swapper/models.json, openclaw.user / openclaw.home). A model with the same key in the site config is merged over the catalog entry field by field (the site wins); list a key in the site config's \"hidden_models\" to hide it. Speeds are tokens per second: decode = one request on its own, decode_concurrent = the total across `concurrency` requests.",
+  "_comment": "The model catalog shipped with each Spark Swapper release. Every entry names the platforms it runs on, how to install it, how to start/stop it and the speeds its recipe publishes. {{USER}}, {{HOME}}, {{API_KEY}} and {{API_PORT}} are filled in from the site config (/etc/spark-swapper/models.json, openclaw.user / openclaw.home, api_key, api_port); {{NAME}} for a name under \"snippets\" is replaced by that text. A model with the same key in the site config is merged over the catalog entry field by field (the site wins); list a key in the site config's \"hidden_models\" to hide it. Speeds are tokens per second: decode = one request on its own, decode_concurrent = the total across `concurrency` requests. \"footprint\" names what a model leaves on the disk besides what its install steps make (dirs, hf repos, images, shared_images): the Storage tab measures it and Delete removes it, keeping whatever another installed model still uses. \"profiles\" are the engine templates behind Add from Hugging Face; \"builds\" are Dockerfiles for images built on the box.",
 
-  "catalog_version": 2,
+  "catalog_version": 3,
 
   "models": {
     "tf27b": {
@@ -34,6 +34,12 @@
         "code": 136.9, "source": "sparkDash (MiaAI-Lab), prose; code decodes at 136.9 tok/s", "estimate": false
       },
       "repo": "https://github.com/MiaAI-Lab/Qwen3.8-27B-DGX-Spark-TensorFold",
+      "footprint": {
+        "dirs": ["{{HOME}}/.cache/tensorfold-qwen38-27b"],
+        "hf": ["Vontra/Qwen3.8-27B-MLX-4bit", "z-lab/Qwen3.8-27B-DFlash2"],
+        "images": ["tensorfold-qwen38-27b", "ghcr.io/miaai-lab/qwen3.8-27b-dgx-spark-tensorfold"],
+        "shared_images": ["nvcr.io/nvidia/pytorch:26.07-py3"]
+      },
       "install": {
         "requires": ["git", "docker"],
         "size_gb": 60,
@@ -54,8 +60,8 @@
       "platforms": ["nvidia-gb10"],
       "family": "qwen3.8-flash-next",
       "title": "Qwen3.8 Flash Next",
-      "tagline": "The strongest model that fits one Spark: a 125B mixture of experts, with images and video.",
-      "engine": "TensorFold Zig engine · INT4-AutoRound · MTP",
+      "tagline": "The strongest model that fits one Spark: a 125B mixture of experts on NVIDIA's FP4 checkpoint, close to full precision, with images and video.",
+      "engine": "TensorFold Zig engine · NVIDIA FP4 (QAD) · MTP drafts",
       "recommended": true,
       "kind": "recipe-script",
       "dir": "{{HOME}}/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold",
@@ -69,22 +75,28 @@
       "context": 262144,
       "vision": true,
       "anthropic_api": true,
-      "min_free_gib": 94,
+      "min_free_gib": 108,
       "start_timeout_s": 3000,
-      "eta": "a few minutes (loads ~66 GiB of weights)",
+      "eta": "a few minutes (loads ~81 GiB of weights)",
       "openclaw_provider": "tfflash",
-      "openclaw_model_name": "Qwen3.8 Flash Next (TensorFold, MTP, 262K ctx)",
+      "openclaw_model_name": "Qwen3.8 Flash Next (TensorFold, NVIDIA FP4, MTP, 262K ctx)",
       "openclaw_context": 262144,
       "perf": {
-        "decode": 64.4, "decode_concurrent": 200.9, "concurrency": 8, "prefill": 2606.0,
-        "code": 57.5, "source": "sparkDash (MiaAI-Lab), prose, FP8 KV with vision on", "estimate": false
+        "decode": 49.8, "decode_concurrent": 198.2, "concurrency": 5, "prefill": 2400.0,
+        "code": 50.9, "source": "the recipe's own tools/bench_streams.py (greedy, thinking off, 256 tokens, median of 3): 49.8 tok/s alone, 198.2 across 5. Its sparkDash run reads 46–55 alone and 132.7 across 5", "estimate": false
       },
       "repo": "https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold",
+      "footprint": {
+        "dirs": ["{{HOME}}/.cache/tensorfold-qwen38", "{{HOME}}/.local/state/qwen38-flash-next-tf"],
+        "hf": ["nvidia/Qwen3.8-Flash-Next-FP4-Local", "azampatti/Qwen3.8-Flash-Next-125B-A5B-INT4-AutoRound"],
+        "images": ["tensorfold-qwen38", "ghcr.io/miaai-lab/qwen3.8-flash-next-single-dgx-spark-tensorfold"],
+        "shared_images": ["nvcr.io/nvidia/pytorch:26.07-py3"]
+      },
       "install": {
         "requires": ["git", "docker"],
-        "size_gb": 165,
-        "time": "1–2 hours: builds the engine image and downloads the ~122 GiB checkpoint",
-        "note": "The build needs at least 10 GiB of free memory. If a large model is serving and memory is tight, it stops and says so — switch to a smaller model first, then install.",
+        "size_gb": 140,
+        "time": "1–2 hours: pulls or builds the engine image and downloads the ~96 GiB checkpoint",
+        "note": "Needs about 160 GB of free disk. The engine build needs at least 10 GiB of free memory: if a large model is serving and memory is tight, it stops and says so — switch to a smaller model first, then install.",
         "steps": [
           { "do": "git", "url": "https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold.git", "dir": "{{HOME}}/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold" },
           { "do": "run", "cmd": ["bash", "scripts/prepare.sh"], "cwd": "{{HOME}}/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold", "as": "user", "timeout": 21600 }
@@ -96,8 +108,60 @@
       }
     },
 
-    "nemotron": {
+    "bolt": {
       "order": 3,
+      "platforms": ["nvidia-gb10"],
+      "family": "nemotron-3.5-bolt",
+      "title": "Nemotron 3.5 Bolt",
+      "tagline": "NVIDIA's 74B reasoner packed into 23 GB: sixteen requests at once, images and video, and most of the Spark's memory left over.",
+      "engine": "TensorFold Zig engine · IQ2_XXS + NVFP4 · LiLiCorr drafts",
+      "kind": "recipe-script",
+      "dir": "{{HOME}}/Nemotron-3.5-Bolt-TensorFold-DGX-Spark",
+      "start": ["bash", "./start.sh"],
+      "stop": ["bash", "./stop.sh"],
+      "run_as": "user",
+      "env": { "HOST": "127.0.0.1", "WAIT_TIMEOUT": "1800", "TENSORFOLD_API_KEY": "{{API_KEY}}" },
+      "own_key": true,
+      "container": "nemotron35-bolt-tf",
+      "served_id": "Nemotron-3.5-Bolt",
+      "context": 262144,
+      "anthropic_api": true,
+      "vision": true,
+      "min_free_gib": 56,
+      "start_timeout_s": 1800,
+      "eta": "about a minute (loads ~23 GiB of weights)",
+      "openclaw_provider": "bolt",
+      "openclaw_model_name": "Nemotron 3.5 Bolt 74B-A9B (TensorFold, LiLiCorr drafts, 262K ctx)",
+      "openclaw_context": 262144,
+      "perf": {
+        "decode": 73.7, "decode_concurrent": 240.3, "concurrency": 8, "prefill": 2400.0,
+        "code": 137.3, "source": "the recipe's own measurement of 2026-10-20 (TensorFold's bench_concurrent.py, greedy, thinking off, 256 tokens): 73.7 tok/s alone on prose, 240.3 across 8; code 137.3 alone, 342 across 8", "estimate": false
+      },
+      "repo": "https://github.com/MiaAI-Lab/Nemotron-3.5-Bolt-TensorFold-DGX-Spark",
+      "footprint": {
+        "dirs": ["{{HOME}}/.cache/tensorfold-nemotron-bolt", "{{HOME}}/.local/state/nemotron35-bolt-tf"],
+        "hf": ["nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB", "nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-LiLiCorr"],
+        "images": ["tensorfold-nemotron-bolt", "ghcr.io/miaai-lab/nemotron-3.5-bolt-tensorfold-dgx-spark"],
+        "shared_images": ["nvcr.io/nvidia/pytorch:26.07-py3"]
+      },
+      "install": {
+        "requires": ["git", "docker"],
+        "size_gb": 55,
+        "time": "20–60 minutes: downloads ~25 GB of weights and builds the engine image (no prebuilt image is published for the current revision)",
+        "note": "The engine build needs at least 10 GiB of free memory and about 40 GB of free disk. If a large model is serving and memory is tight, switch to a smaller one first.",
+        "steps": [
+          { "do": "git", "url": "https://github.com/MiaAI-Lab/Nemotron-3.5-Bolt-TensorFold-DGX-Spark.git", "dir": "{{HOME}}/Nemotron-3.5-Bolt-TensorFold-DGX-Spark" },
+          { "do": "run", "cmd": ["bash", "scripts/prepare.sh"], "cwd": "{{HOME}}/Nemotron-3.5-Bolt-TensorFold-DGX-Spark", "as": "user", "timeout": 14400 }
+        ],
+        "ready": [
+          { "file": "{{HOME}}/Nemotron-3.5-Bolt-TensorFold-DGX-Spark/start.sh" },
+          { "file": "{{HOME}}/.local/state/nemotron35-bolt-tf/prepared" }
+        ]
+      }
+    },
+
+    "nemotron": {
+      "order": 4,
       "platforms": ["nvidia-gb10"],
       "family": "nemotron-3.5-lightning",
       "title": "Nemotron 3.5 Lightning",
@@ -143,8 +207,205 @@
       }
     },
 
+    "laguna": {
+      "order": 5,
+      "platforms": ["nvidia-gb10"],
+      "family": "laguna-s-2.1",
+      "title": "Laguna S 2.1",
+      "tagline": "Poolside's 118B coding model in 4-bit, with DFlash drafts: 256K context, tool calling and reasoning.",
+      "engine": "vLLM 0.25.1 · NVFP4 · DFlash drafts",
+      "kind": "docker",
+      "container": "laguna-s-2.1-nvfp4",
+      "served_id": "laguna-s-2.1",
+      "context": 262144,
+      "vision": false,
+      "min_free_gib": 108,
+      "start_timeout_s": 2400,
+      "eta": "about 15 minutes the first time (kernel compilation); faster after",
+      "openclaw_provider": "laguna",
+      "openclaw_model_name": "Laguna S 2.1 NVFP4 (vLLM, DFlash, 256K ctx)",
+      "openclaw_context": 262144,
+      "perf": {
+        "decode": 76.7, "decode_concurrent": 139.6, "concurrency": 4,
+        "source": "the recipe's own benchmark chart: 76.7 tok/s for one request, 34.9 each with 4 at once", "estimate": false
+      },
+      "repo": "https://github.com/MiaAI-Lab/Laguna-S-2.1-DGX-Spark-RTX-6000-PRO",
+      "notes": [
+        "The recipe's limit of 4 requests at once is deliberate: DFlash crashes at vLLM's default of 256.",
+        "The first start installs matching FlashInfer kernels from flashinfer.ai, so the box needs internet then."
+      ],
+      "install": {
+        "requires": ["docker"],
+        "size_gb": 125,
+        "time": "1–2 hours: pulls the vLLM image and downloads ~100 GB of weights",
+        "note": "Needs about 125 GB of free disk. Weights go to the Hugging Face cache, shared with the recipes.",
+        "steps": [
+          { "do": "mkdirs", "paths": ["{{HOME}}/.cache/huggingface", "{{HOME}}/.cache/flashinfer"] },
+          { "do": "docker_pull", "image": "vllm/vllm-openai:v0.25.1", "timeout": 7200 },
+          { "do": "hf_snapshot", "repo": "poolside/Laguna-S-2.1-NVFP4" },
+          { "do": "hf_snapshot", "repo": "poolside/Laguna-S-2.1-DFlash-NVFP4" }
+        ],
+        "ready": [
+          { "docker_image_or_container": "vllm/vllm-openai:v0.25.1", "container": "laguna-s-2.1-nvfp4" },
+          { "hf_snapshot": "poolside/Laguna-S-2.1-NVFP4" },
+          { "hf_snapshot": "poolside/Laguna-S-2.1-DFlash-NVFP4" }
+        ]
+      },
+      "footprint": { "dirs": ["{{HOME}}/.cache/flashinfer"] },
+      "docker_run": [
+        "--network", "host", "--ipc", "host", "--shm-size", "32g", "--gpus", "all",
+        "--ulimit", "memlock=-1:-1", "--cap-add", "IPC_LOCK", "--user", "root",
+        "--restart", "unless-stopped",
+        "-e", "VLLM_TARGET_DEVICE=cuda", "-e", "VLLM_TRUST_REMOTE_CODE=1", "-e", "CUTE_DSL_ARCH=sm_121a",
+        "-e", "MAX_JOBS=4", "-e", "NVCC_THREADS=2", "-e", "FLASHINFER_NVCC_THREADS=2",
+        "-e", "HF_HOME=/root/.cache/huggingface", "-e", "HF_HUB_OFFLINE=1",
+        "-v", "{{HOME}}/.cache/huggingface:/root/.cache/huggingface",
+        "-v", "{{HOME}}/.cache/flashinfer:/root/.cache/flashinfer",
+        "--entrypoint", "bash", "vllm/vllm-openai:v0.25.1", "-c", "{{LAGUNA_BOOTSTRAP}}", "laguna",
+        "poolside/Laguna-S-2.1-NVFP4",
+        "--host", "127.0.0.1", "--port", "{{API_PORT}}", "--api-key", "{{API_KEY}}",
+        "--served-model-name", "laguna-s-2.1",
+        "--tensor-parallel-size", "1", "--dtype", "bfloat16", "--attention-backend", "FLASHINFER",
+        "--trust-remote-code", "--gpu-memory-utilization", "0.85", "--max-model-len", "262144",
+        "--max-num-seqs", "4", "--max-num-batched-tokens", "8192",
+        "--enable-auto-tool-choice", "--tool-call-parser", "poolside_v1", "--reasoning-parser", "poolside_v1",
+        "--default-chat-template-kwargs", "{\"enable_thinking\":true}",
+        "--override-generation-config", "{\"temperature\":0.7,\"top_p\":0.95,\"top_k\":20}",
+        "--speculative-config", "{\"model\":\"poolside/Laguna-S-2.1-DFlash-NVFP4\",\"num_speculative_tokens\":7,\"method\":\"dflash\"}"
+      ]
+    },
+
+    "ornith": {
+      "order": 6,
+      "platforms": ["nvidia-gb10"],
+      "family": "ornith-1.5",
+      "title": "Ornith 1.5 122B",
+      "tagline": "A 125B mixture of experts at 4 bits per weight (EXL3): 65 GB of weights, 262K native context, within 0.014 nats of full precision.",
+      "engine": "ExLlamaV3 · TabbyAPI · EXL3 4-bit",
+      "experimental": true,
+      "kind": "docker",
+      "container": "swapper-ornith-122b",
+      "served_id": "ornith-1.5-122b",
+      "template_kwargs": false,
+      "context": 131072,
+      "vision": false,
+      "min_free_gib": 80,
+      "start_timeout_s": 1800,
+      "eta": "a few minutes (loads ~64 GiB of weights)",
+      "openclaw_provider": "ornith",
+      "openclaw_model_name": "Ornith 1.5 122B EXL3 4-bit (ExLlamaV3, 128K ctx)",
+      "openclaw_context": 131072,
+      "perf": {
+        "source": "not published (the model card says throughput wasn't measured) — Spark Swapper measures it after the first load", "estimate": false
+      },
+      "repo": "https://huggingface.co/Mia-AiLab/Ornith-1.5-122B-EXL3-EAQv1-4-bpw",
+      "notes": [
+        "Experimental: the weights' card only reports a short text smoke test with ExLlamaV3 v1.6.1; vision, long context and speed are untested, and ExLlamaV3 on the Spark's GPU architecture is compiled here from source.",
+        "The first install builds the ExLlamaV3 + TabbyAPI image on the box: 20–40 minutes, about 24 GiB of free memory while it compiles."
+      ],
+      "install": {
+        "requires": ["docker"],
+        "size_gb": 95,
+        "time": "40–90 minutes: downloads 65.6 GB of weights and builds the ExLlamaV3 image (it compiles CUDA kernels)",
+        "note": "Building needs about 24 GiB of free memory. If a large model is serving, switch to a smaller one first.",
+        "steps": [
+          { "do": "docker_build", "build": "tabby-exl3" },
+          { "do": "hf_snapshot", "repo": "Mia-AiLab/Ornith-1.5-122B-EXL3-EAQv1-4-bpw" }
+        ],
+        "ready": [
+          { "docker_image_or_container": "swapper/tabbyapi-exl3:1.6.3-a270c55", "container": "swapper-ornith-122b" },
+          { "hf_snapshot": "Mia-AiLab/Ornith-1.5-122B-EXL3-EAQv1-4-bpw" }
+        ]
+      },
+      "footprint": { "shared_images": ["nvcr.io/nvidia/pytorch:26.07-py3"] },
+      "docker_run": [
+        "--network", "host", "--ipc", "host", "--shm-size", "16g", "--gpus", "all",
+        "--ulimit", "memlock=-1", "--restart", "unless-stopped",
+        "-e", "TABBY_API_KEY={{API_KEY}}", "-e", "TABBY_PORT={{API_PORT}}", "-e", "TABBY_CTX=131072",
+        "-e", "TABBY_NAME=ornith-1.5-122b",
+        "-v", "{{HOME}}/.cache/huggingface/hub/models--Mia-AiLab--Ornith-1.5-122B-EXL3-EAQv1-4-bpw:/model:ro",
+        "--entrypoint", "bash", "swapper/tabbyapi-exl3:1.6.3-a270c55", "-c", "{{TABBY_ENTRYPOINT}}"
+      ]
+    },
+
+    "vllmfp4": {
+      "order": 7,
+      "platforms": ["nvidia-gb10"],
+      "family": "qwen3.8-flash-next",
+      "title": "Qwen3.8 Flash Next (NVIDIA FP4 · vLLM)",
+      "tagline": "NVIDIA's own FP4 build of Flash Next on the community b12x vLLM image: the same checkpoint TensorFold serves, through vLLM's API.",
+      "engine": "vLLM · b12x kernels · NVIDIA FP4 (QAD) · MTP",
+      "kind": "docker",
+      "container": "swapper-qwen38-flash-next-fp4",
+      "served_id": "qwen3.8-flash-next-fp4",
+      "context": 262144,
+      "vision": true,
+      "min_free_gib": 100,
+      "start_timeout_s": 2700,
+      "eta": "several minutes the first time (kernel compilation); faster after",
+      "openclaw_provider": "vllmfp4",
+      "openclaw_model_name": "Qwen3.8 Flash Next NVIDIA FP4 (vLLM b12x, MTP, 262K ctx)",
+      "openclaw_context": 262144,
+      "perf": {
+        "source": "not published (NVIDIA's card reports accuracy only) — Spark Swapper measures it after the first load", "estimate": false
+      },
+      "repo": "https://huggingface.co/nvidia/Qwen3.8-Flash-Next-FP4-Local",
+      "notes": [
+        "Uses the same checkpoint as the TensorFold recipe: if that is installed, nothing is downloaded again.",
+        "NVIDIA's card says the checkpoint needs community vLLM containers until the format lands upstream; this one is eugr/spark-vllm-b12x, pinned to the 2026-10-15 build."
+      ],
+      "install": {
+        "requires": ["docker"],
+        "size_gb": 112,
+        "time": "1–2 hours: pulls the ~10 GB vLLM image and downloads the ~96 GiB checkpoint (skipped if the TensorFold recipe already fetched it)",
+        "note": "Needs about 110 GB of free disk when nothing is downloaded yet.",
+        "steps": [
+          { "do": "mkdirs", "paths": ["{{HOME}}/.cache/huggingface", "{{HOME}}/.cache/vllm", "{{HOME}}/.cache/flashinfer", "{{HOME}}/.triton", "{{HOME}}/.cache/b12x"] },
+          { "do": "docker_pull", "image": "eugr/spark-vllm-b12x:nightly-20261015", "timeout": 7200 },
+          { "do": "hf_snapshot", "repo": "nvidia/Qwen3.8-Flash-Next-FP4-Local", "revision": "b9ce18a6887e18c089fdea8509a33e63429a3300" }
+        ],
+        "ready": [
+          { "docker_image_or_container": "eugr/spark-vllm-b12x:nightly-20261015", "container": "swapper-qwen38-flash-next-fp4" },
+          { "hf_snapshot": "nvidia/Qwen3.8-Flash-Next-FP4-Local", "revision": "b9ce18a6887e18c089fdea8509a33e63429a3300" }
+        ]
+      },
+      "footprint": { "dirs": ["{{HOME}}/.cache/vllm", "{{HOME}}/.cache/b12x"] },
+      "docker_run": [
+        "--network", "host", "--ipc", "host", "--shm-size", "16g", "--gpus", "all",
+        "--ulimit", "memlock=-1", "--ulimit", "stack=67108864",
+        "--security-opt", "seccomp=unconfined", "--security-opt", "apparmor=unconfined",
+        "--restart", "unless-stopped",
+        "-e", "HF_HOME=/root/.cache/huggingface", "-e", "HF_HUB_OFFLINE=1",
+        "-e", "VLLM_PLE_TABLE_MEMORY=disk", "-e", "B12X_DISK_BACKEND=io_uring", "-e", "CUTE_DSL_ARCH=sm_121a",
+        "-e", "SAFETENSORS_FAST_GPU=1", "-e", "VLLM_WORKER_MULTIPROC_METHOD=spawn", "-e", "VLLM_SSM_CONV_STATE_LAYOUT=DS",
+        "-e", "VLLM_USE_AOT_COMPILE=1", "-e", "VLLM_USE_MEGA_AOT_ARTIFACT=1", "-e", "VLLM_USE_V2_MODEL_RUNNER=1",
+        "-e", "B12X_POLICY_MODE=auto", "-e", "VLLM_MXFP8_LM_HEAD=1",
+        "-e", "VLLM_B12X_MOE_FP4_LAYER_MAX_INPUT_SCALE=w13", "-e", "VLLM_B12X_MOE_FP4_FORCE_A16=1",
+        "-e", "B12X_W4A16_A4_PREFILL=1",
+        "-v", "{{HOME}}/.cache/huggingface:/root/.cache/huggingface",
+        "-v", "{{HOME}}/.cache/vllm:/root/.cache/vllm",
+        "-v", "{{HOME}}/.cache/flashinfer:/root/.cache/flashinfer",
+        "-v", "{{HOME}}/.triton:/root/.triton",
+        "-v", "{{HOME}}/.cache/b12x:/root/.cache/b12x",
+        "--entrypoint", "bash", "eugr/spark-vllm-b12x:nightly-20261015", "-c", "exec vllm serve \"$@\"", "vllm-serve",
+        "nvidia/Qwen3.8-Flash-Next-FP4-Local", "--revision", "b9ce18a6887e18c089fdea8509a33e63429a3300",
+        "--host", "127.0.0.1", "--port", "{{API_PORT}}", "--api-key", "{{API_KEY}}",
+        "--served-model-name", "qwen3.8-flash-next-fp4",
+        "--tensor-parallel-size", "1", "--pipeline-parallel-size", "1", "--mamba-cache-mode", "align",
+        "--enable-prefix-caching", "--enable-chunked-prefill", "--dtype", "bfloat16", "--kv-cache-dtype", "fp8",
+        "--quantization", "modelopt_mixed", "--block-size", "16", "--load-format", "b12x",
+        "--max-model-len", "262144", "--max-num-seqs", "8", "--max-num-batched-tokens", "4096",
+        "--speculative-config", "{\"method\":\"mtp\",\"num_speculative_tokens\":4}",
+        "--gdn-decode-kernel", "b12x", "--linear-backend", "b12x", "--moe-backend", "b12x",
+        "--no-enable-flashinfer-autotune", "--mm-encoder-tp-mode", "data",
+        "--reasoning-parser", "qwen3", "--tool-call-parser", "qwen3_xml", "--enable-auto-tool-choice",
+        "--compilation-config", "{\"pass_config\":{\"fuse_act_quant\":true}}",
+        "--gpu-memory-utilization", "0.8"
+      ]
+    },
+
     "standard": {
-      "order": 4,
+      "order": 8,
       "platforms": ["nvidia-gb10"],
       "family": "qwen3.8-27b",
       "title": "Qwen3.8 27B (SGLang)",
@@ -165,6 +426,7 @@
         "decode": 24.2, "source": "the recipe's own benchmark (EAGLE/MTP, code probe; ~18 tok/s on long prose)", "estimate": false
       },
       "repo": "https://github.com/MiaAI-Lab/Qwen3.8-27B-SGLang-DGX-Spark",
+      "footprint": { "dirs": ["{{HOME}}/sglang-spark"] },
       "install": {
         "requires": ["docker"],
         "size_gb": 40,
@@ -212,7 +474,7 @@
     },
 
     "flash": {
-      "order": 5,
+      "order": 9,
       "platforms": ["nvidia-gb10"],
       "family": "qwen3.8-flash-next",
       "title": "Qwen3.8 Flash Next (vLLM)",
@@ -238,6 +500,7 @@
         "source": "sparkDash sweep in the recipe's README (prose)", "estimate": false
       },
       "repo": "https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark",
+      "footprint": { "hf": ["Mia-AiLab/Qwen3.8-Flash-Next-NVFP4"] },
       "install": {
         "requires": ["git", "docker"],
         "size_gb": 130,
@@ -400,6 +663,186 @@
       "url": "https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark.git",
       "dir": "{{HOME}}/Qwen3.8-Flash-Next-Single-DGX-Spark",
       "checkpoint": "models--Mia-AiLab--Qwen3.8-Flash-Next-NVFP4"
+    }
+  },
+
+  "snippets": {
+    "LAGUNA_BOOTSTRAP": [
+      "set -e",
+      "export PATH=/usr/local/cuda/bin:$PATH",
+      "FLASHINFER_VERSION=0.6.15.dev20260712",
+      "INSTALLED=\"$(python3 -c 'import flashinfer; print(flashinfer.__version__)' 2>/dev/null || true)\"",
+      "if [[ \"${INSTALLED}\" == \"${FLASHINFER_VERSION}\" ]]; then",
+      "  echo \"[bootstrap] FlashInfer ${FLASHINFER_VERSION} already installed\"",
+      "else",
+      "  echo \"[bootstrap] Installing FlashInfer ${FLASHINFER_VERSION} for FP4 support (found: ${INSTALLED:-none}) ...\"",
+      "  pip install --upgrade --no-deps \"flashinfer-python==${FLASHINFER_VERSION}\" \"flashinfer-cubin==${FLASHINFER_VERSION}\" \"flashinfer-jit-cache==${FLASHINFER_VERSION}+cu130\" --extra-index-url https://flashinfer.ai/whl/nightly/ --extra-index-url https://flashinfer.ai/whl/nightly/cu130/ \\",
+      "    && pip install --upgrade \"cuda-tile==1.5.0\" \"nccl4py==0.3.1\" \\",
+      "    && echo \"[bootstrap] Installed flashinfer ${FLASHINFER_VERSION}\" \\",
+      "    || { echo \"[bootstrap] FATAL: flashinfer ${FLASHINFER_VERSION} install failed; refusing to start with mismatched FP4 kernels\"; exit 1; }",
+      "fi",
+      "echo \"[bootstrap] Starting vLLM ...\"",
+      "exec vllm serve \"$@\""
+    ],
+    "TABBY_ENTRYPOINT": [
+      "set -e",
+      "cd /opt/tabbyAPI",
+      "SNAP=$(ls -dt /model/snapshots/*/ 2>/dev/null | head -n1)",
+      "[ -n \"$SNAP\" ] || { echo \"no model snapshot under /model/snapshots\" >&2; exit 1; }",
+      "mkdir -p /srv/models",
+      "ln -sfn \"${SNAP%/}\" \"/srv/models/$TABBY_NAME\"",
+      "printf \"api_key: '%s'\\nadmin_key: '%s'\\n\" \"$TABBY_API_KEY\" \"$(head -c 24 /dev/urandom | base64 | tr -dc 'A-Za-z0-9')\" > api_tokens.yml",
+      "cat > config.yml <<EOF",
+      "network:",
+      "  host: 127.0.0.1",
+      "  port: $TABBY_PORT",
+      "  disable_auth: false",
+      "  api_servers: [\"OAI\"]",
+      "model:",
+      "  model_dir: /srv/models",
+      "  model_name: $TABBY_NAME",
+      "  backend: exllamav3",
+      "  max_seq_len: $TABBY_CTX",
+      "  cache_mode: FP16",
+      "EOF",
+      "exec python3 main.py"
+    ]
+  },
+
+  "builds": {
+    "tabby-exl3": {
+      "image": "swapper/tabbyapi-exl3:1.6.3-a270c55",
+      "free_gb": 40,
+      "mem_gb": 24,
+      "args": { "EXLLAMAV3_REF": "v1.6.3", "TABBY_REF": "a270c555db91a5178d72f7dee7bdd34951ac1dad", "MAX_JOBS": "6" },
+      "dockerfile": [
+        "FROM nvcr.io/nvidia/pytorch:26.07-py3",
+        "ARG EXLLAMAV3_REF",
+        "ARG TABBY_REF",
+        "ARG MAX_JOBS=6",
+        "ENV TORCH_CUDA_ARCH_LIST=\"12.1\" MAX_JOBS=${MAX_JOBS} PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1",
+        "RUN pip install --upgrade \"setuptools>=77\" wheel ninja",
+        "RUN git clone https://github.com/turboderp-org/exllamav3 /opt/exllamav3 \\",
+        " && git -C /opt/exllamav3 checkout \"$EXLLAMAV3_REF\" \\",
+        " && cd /opt/exllamav3 && pip install --no-build-isolation .",
+        "RUN pip install \"flash-linear-attention>=0.5.0\"",
+        "RUN git clone https://github.com/theroyallab/tabbyAPI /opt/tabbyAPI \\",
+        " && git -C /opt/tabbyAPI checkout \"$TABBY_REF\" \\",
+        " && pip install \"fastapi-slim>=0.115\" \"pydantic>=2.11,<3\" ruamel.yaml rich \"uvicorn>=0.28.1\" \"jinja2>=3.0.0\" loguru \"sse-starlette>=2.2.0\" packaging \"tokenizers>=0.21.0\" numpy aiofiles aiohttp async_lru huggingface_hub psutil \"httptools>=0.5.0\" pillow requests",
+        "WORKDIR /opt/tabbyAPI"
+      ]
+    }
+  },
+
+  "profiles": {
+    "vllm-spark": {
+      "label": "vLLM (community Spark image)",
+      "platforms": ["nvidia-gb10"],
+      "formats": ["safetensors"],
+      "engine": "vLLM · b12x Spark image",
+      "vision": true,
+      "image_gb": 12,
+      "entry": {
+        "platforms": ["nvidia-gb10"],
+        "kind": "docker",
+        "container": "swapper-{{KEY}}",
+        "start_timeout_s": 2700,
+        "eta": "several minutes the first time (kernel compilation); faster after",
+        "install": {
+          "requires": ["docker"],
+          "steps": [
+            { "do": "mkdirs", "paths": ["{{HOME}}/.cache/huggingface", "{{HOME}}/.cache/vllm", "{{HOME}}/.cache/flashinfer", "{{HOME}}/.triton", "{{HOME}}/.cache/b12x"] },
+            { "do": "docker_pull", "image": "eugr/spark-vllm-b12x:nightly-20261015", "timeout": 7200 },
+            { "do": "hf_snapshot", "repo": "{{REPO}}", "revision": "{{COMMIT}}" }
+          ],
+          "ready": [
+            { "docker_image_or_container": "eugr/spark-vllm-b12x:nightly-20261015", "container": "swapper-{{KEY}}" },
+            { "hf_snapshot": "{{REPO}}", "revision": "{{COMMIT}}" }
+          ]
+        },
+        "footprint": { "dirs": [], "shared_images": [] },
+        "docker_run": [
+          "--network", "host", "--ipc", "host", "--shm-size", "16g", "--gpus", "all",
+          "--ulimit", "memlock=-1", "--ulimit", "stack=67108864",
+          "--security-opt", "seccomp=unconfined", "--security-opt", "apparmor=unconfined",
+          "--restart", "unless-stopped",
+          "-e", "HF_HOME=/root/.cache/huggingface", "-e", "HF_HUB_OFFLINE=1",
+          "-e", "CUTE_DSL_ARCH=sm_121a", "-e", "VLLM_WORKER_MULTIPROC_METHOD=spawn",
+          "-v", "{{HOME}}/.cache/huggingface:/root/.cache/huggingface",
+          "-v", "{{HOME}}/.cache/vllm:/root/.cache/vllm",
+          "-v", "{{HOME}}/.cache/flashinfer:/root/.cache/flashinfer",
+          "-v", "{{HOME}}/.triton:/root/.triton",
+          "--entrypoint", "bash", "eugr/spark-vllm-b12x:nightly-20261015", "-c", "exec vllm serve \"$@\"", "vllm-serve",
+          "{{REPO}}", "--revision", "{{COMMIT}}",
+          "--host", "127.0.0.1", "--port", "{{API_PORT}}", "--api-key", "{{API_KEY}}",
+          "--served-model-name", "{{SLUG}}",
+          "--tensor-parallel-size", "1", "--max-model-len", "{{CTX}}", "--gpu-memory-utilization", "{{UTIL}}",
+          "--enable-prefix-caching", "--enable-chunked-prefill", "--max-num-seqs", "8"
+        ]
+      }
+    },
+
+    "exllamav3": {
+      "label": "ExLlamaV3 · TabbyAPI",
+      "platforms": ["nvidia-gb10"],
+      "formats": ["exl3"],
+      "engine": "ExLlamaV3 · TabbyAPI",
+      "vision": false,
+      "image_gb": 25,
+      "build": true,
+      "entry": {
+        "platforms": ["nvidia-gb10"],
+        "kind": "docker",
+        "container": "swapper-{{KEY}}",
+        "template_kwargs": false,
+        "start_timeout_s": 1800,
+        "eta": "a few minutes (loads the weights into memory)",
+        "install": {
+          "requires": ["docker"],
+          "steps": [
+            { "do": "docker_build", "build": "tabby-exl3" },
+            { "do": "hf_snapshot", "repo": "{{REPO}}", "revision": "{{COMMIT}}" }
+          ],
+          "ready": [
+            { "docker_image_or_container": "swapper/tabbyapi-exl3:1.6.3-a270c55", "container": "swapper-{{KEY}}" },
+            { "hf_snapshot": "{{REPO}}", "revision": "{{COMMIT}}" }
+          ]
+        },
+        "footprint": { "shared_images": ["nvcr.io/nvidia/pytorch:26.07-py3"] },
+        "docker_run": [
+          "--network", "host", "--ipc", "host", "--shm-size", "16g", "--gpus", "all",
+          "--ulimit", "memlock=-1", "--restart", "unless-stopped",
+          "-e", "TABBY_API_KEY={{API_KEY}}", "-e", "TABBY_PORT={{API_PORT}}", "-e", "TABBY_CTX={{CTX}}",
+          "-e", "TABBY_NAME={{SLUG}}",
+          "-v", "{{HOME}}/.cache/huggingface/hub/models--{{REPO_DIR}}:/model:ro",
+          "--entrypoint", "bash", "swapper/tabbyapi-exl3:1.6.3-a270c55", "-c", "{{TABBY_ENTRYPOINT}}"
+        ]
+      }
+    },
+
+    "llamacpp-gguf": {
+      "label": "llama.cpp (Vulkan)",
+      "platforms": ["amd-strix-halo"],
+      "formats": ["gguf"],
+      "engine": "llama.cpp · Vulkan",
+      "vision": false,
+      "image_gb": 0,
+      "entry": {
+        "platforms": ["amd-strix-halo"],
+        "kind": "llamacpp",
+        "unit": "swapper-llama-{{KEY}}",
+        "args": [
+          "--ctx-size", "{{CTX}}", "--n-gpu-layers", "999", "--parallel", "1", "--threads", "12",
+          "--batch-size", "512", "--ubatch-size", "512", "--flash-attn", "on", "--kv-unified", "--no-mmap", "--jinja"
+        ],
+        "start_timeout_s": 900,
+        "eta": "a minute or so",
+        "install": {
+          "requires": ["vulkan", "llamacpp"],
+          "steps": [ { "do": "hf_files" } ],
+          "ready": [ { "hf_files": true } ]
+        }
+      }
     }
   }
 }

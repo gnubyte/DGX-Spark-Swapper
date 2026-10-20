@@ -1,5 +1,36 @@
 # Changelog
 
+## 2.1.0
+
+- **New recipes.** *Nemotron 3.5 Bolt* (NVIDIA's 74B-A9B in 23 GB on TensorFold's Zig engine,
+  16 streams, images and video) and *Laguna S 2.1* (Poolside's 118B coding model on vLLM 0.25.1
+  with DFlash drafts) join the DGX Spark models, from MiaAI-Lab's recipes. Two Hugging Face
+  models can be installed and switched to with one button as well: *Qwen3.8 Flash Next on
+  NVIDIA's FP4 checkpoint with vLLM* (the community b12x Spark image, sharing the checkpoint the
+  TensorFold recipe already downloads) and *Ornith 1.5 122B* (EXL3 4-bit, ExLlamaV3 + TabbyAPI,
+  built on the box — experimental).
+- **Qwen3.8 Flash Next (TensorFold) is brought up to date** with its recipe: NVIDIA's FP4
+  checkpoint on the new Zig engine (about 49.8 tok/s alone, 198 across 5, prefill ≈2,400 tok/s;
+  it needs ~108 GiB free to start and ~160 GB of disk). The memory and disk figures, speeds and
+  install notes in the catalog say so.
+- **Add from Hugging Face.** Paste a model link on the Models tab (admin): Spark Swapper checks
+  the repo, says whether the box can run it and how, downloads it into the shared Hugging Face
+  cache (resumable, SHA-256 checked, the token never sent to the CDN) and creates a card.
+  Safetensors repos run on vLLM, EXL3 on ExLlamaV3/TabbyAPI (DGX Spark), GGUF on llama.cpp
+  (Strix Halo). A Hugging Face token for gated models goes on the Settings tab.
+- **Storage tab.** Disk usage with the models' share, what each model takes (weights, engine
+  image, recipe, caches), what deleting it really frees (weights and images that two models share
+  are counted once and kept for the one that remains), and a list of leftovers nothing accounts
+  for — old checkpoints, unused images, docker's build cache. Cards show their size on disk and
+  the footer a disk meter.
+- **Delete models.** Delete… on a model card or the Storage tab removes its container, weights,
+  images, recipe, caches, measured speed and OpenClaw provider entry, after showing the plan.
+  It refuses the model that is serving and removes nothing outside the box user's home, the
+  Hugging Face cache and the Swapper's download folder.
+- New model kind `docker` (a container made from the catalog entry's `docker_run`), install steps
+  `hf_snapshot`, `docker_build` and `mkdirs`, shared `snippets`/`builds`/`profiles` in the
+  catalog. The speed check no longer sends `chat_template_kwargs` to servers that reject it.
+
 ## 2.0.1
 
 - **Connect Vision.** The Mac and Windows apps that connect with a connection code are

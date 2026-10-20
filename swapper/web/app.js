@@ -77,6 +77,14 @@ const fmtWhen = (t) => {
   return d.toLocaleDateString([], { year: "numeric", month: "short", day: "numeric" });
 };
 const fmtRate = (n) => n >= 100 ? `${Math.round(n)}` : `${+n.toFixed(1)}`;
+// Disk sizes the way docker and Hugging Face print them: decimal GB / TB.
+const fmtBytes = (n) => {
+  if (n == null) return "?";
+  for (const [u, v] of [["TB", 1e12], ["GB", 1e9], ["MB", 1e6], ["KB", 1e3]]) {
+    if (n >= v) { const x = n / v; return `${x >= 100 ? Math.round(x) : x >= 10 ? x.toFixed(1) : x.toFixed(2)} ${u}`; }
+  }
+  return `${n} B`;
+};
 
 let me = null;        // {username, role}
 let session = {};     // version, platform, platform_label, hostname, demo
@@ -133,7 +141,7 @@ $("gate-form").addEventListener("submit", async (ev) => {
 
 /* ───────────── app shell / tabs ───────────── */
 
-const TABS = ["models", "connect", "provision", "users", "settings"];
+const TABS = ["models", "storage", "connect", "provision", "users", "settings"];
 // Sections inside a tab that links may point at: #vision opens the Connect tab there.
 const SECTION_TABS = new Map([["vision", "connect"]]);
 // Legacy anchors that older guides and bookmarks still use. The Vision apps were called
@@ -165,10 +173,11 @@ function switchTab(name, anchor) {
   for (const tab of TABS) $(`pane-${tab === "provision" ? "provision" : tab}`).hidden = name !== tab;
   history.replaceState(null, "", `#${name}`);
   if (name === "models") poll(); else stopPoll();
+  if (name === "storage") loadStorage(); else clearTimeout(storageTimer);
   if (name === "connect") loadConnect(anchor);
   if (name === "provision") pollProvisioning();
   if (name === "users" && me.role === "admin") loadUsers();
-  if (name === "settings" && me.role === "admin") loadUpdates();
+  if (name === "settings" && me.role === "admin") { loadUpdates(); loadHfToken(); }
 }
 
 document.querySelectorAll(".tab").forEach((t) =>
@@ -288,10 +297,21 @@ function render() {
     title: $("progress-title"), time: $("progress-time"), steps: $("steps"), note: $("progress-note"),
     log: $("log"), logWrap: $("log-wrap"),
   }, "swap");
-  renderJob($("minstall"), s.install_job && s.install_job.target.startsWith("install:model:") ? s.install_job : null, {
+  const ij = s.install_job;
+  const modelJob = ij && (ij.target.startsWith("install:model:") || ij.target.startsWith("delete:")) ? ij : null;
+  renderJob($("minstall"), modelJob, {
     title: $("minstall-title"), time: $("minstall-time"), steps: $("minstall-steps"), note: $("minstall-note"),
     log: $("minstall-log"), logWrap: $("minstall-log-wrap"),
   }, "install");
+  $("models-toolbar").hidden = !(me && me.role === "admin");
+
+  const disk = s.disk;
+  $("disk-meter").hidden = !disk;
+  if (disk && disk.total) {
+    $("disk-bar").style.width = `${Math.round((disk.total - disk.free) / disk.total * 100)}%`;
+    $("disk-bar").parentElement.className = `bar${disk.free < 40e9 ? " bad" : disk.free < 120e9 ? " warn" : ""}`;
+    $("disk-text").textContent = `${fmtBytes(disk.free)} free of ${fmtBytes(disk.total)}`;
+  }
 
   const mem = s.memory;
   const used = mem.total ? (mem.total - mem.available) / mem.total : 0;
@@ -318,14 +338,18 @@ function card(m, s, running, installing) {
 
   const head = el("div", "head");
   head.append(el("h3", "", m.title));
-  if (m.recommended) head.append(el("span", "tag", "Recommended"));
-  else if (m.superseded_by) head.append(el("span", "tag old", "Older recipe"));
+  const tags = el("div", "tags");
+  if (m.recommended) tags.append(el("span", "tag", "Recommended"));
+  else if (m.superseded_by) tags.append(el("span", "tag old", "Older recipe"));
+  if (m.experimental) tags.append(el("span", "tag exp", "Experimental"));
+  if (tags.childNodes.length) head.append(tags);
   c.append(head, el("div", "engine", m.engine), el("p", "muted", m.tagline));
 
   const chips = el("div", "chips");
   chips.append(el("span", "chip", `${fmtCtx(m.context)} context`));
   for (const p of perfChips(m)) chips.append(p);
   if (m.vision) chips.append(el("span", "chip", "Images & video"));
+  if (m.disk_bytes) chips.append(el("span", "chip disk", `${fmtBytes(m.disk_bytes)} on disk`));
   if (isActive) chips.append(el("span", "chip on", "Serving now"));
   if (isLoading) chips.append(el("span", "chip wait", "Loading"));
   if (isInstalling) chips.append(el("span", "chip wait", "Installing"));
@@ -343,6 +367,7 @@ function card(m, s, running, installing) {
   if (!m.installed && m.install && m.install.time) lines.push(`Install: ${m.install.time}${m.install.size_gb ? ` (~${m.install.size_gb} GB of disk)` : ""}.`);
   if (!m.installed && m.install_detail) lines.push(`Missing: ${m.install_detail}.`);
   if (m.anthropic_api) lines.push("Also speaks the Anthropic Messages API (for Claude Code and similar tools).");
+  lines.push(...(m.notes || []));
   for (const l of lines) more.append(el("p", "", l));
   if (m.repo) {
     const a = el("a", "", "The recipe ↗");
@@ -367,8 +392,36 @@ function card(m, s, running, installing) {
       actions.append(el("span", "meta", [m.install.size_gb ? `~${m.install.size_gb} GB` : "", (m.install.time || "").split(":")[0]].filter(Boolean).join(" · ")));
     }
   }
+  if (me && me.role === "admin" && (m.installed || m.disk_bytes > 0 || m.custom)) {
+    const d = el("button", "btn ghost small danger", m.installed || m.disk_bytes > 0 ? "Delete…" : "Remove…");
+    d.disabled = isActive || isLoading || running || !!installing;
+    d.title = isActive ? "Switch to another model first." : "Take it off this box and free its disk space.";
+    d.addEventListener("click", () => deleteModel(m));
+    actions.append(d);
+  }
   c.append(actions);
   return c;
+}
+
+/* "Installing X", "Deleted X", "Couldn't remove Y": the headline of an install, delete or removal job. */
+function jobTitle(job) {
+  const t = job.target || "";
+  const run = job.state === "running", done = job.state === "done";
+  if (t.startsWith("install:model:")) {
+    const n = modelTitle(t.slice("install:model:".length));
+    return run ? `Installing ${n}` : done ? `Installed ${n}` : `Couldn't install ${n}`;
+  }
+  if (t.startsWith("delete:")) {
+    const n = modelTitle(t.slice("delete:".length));
+    return run ? `Deleting ${n}` : done ? `Deleted ${n}` : `Couldn't delete ${n}`;
+  }
+  if (t.startsWith("delete-other:")) {
+    const [, kind, ...rest] = t.split(":");
+    const n = kind === "builder" ? "Docker's build cache" : rest.join(":");
+    return run ? `Removing ${n}` : done ? `Removed ${n}` : `Couldn't remove ${n}`;
+  }
+  const name = t.replace("install:", "").replace("model:", "model ");
+  return run ? `Installing ${name}` : done ? `Finished: ${name}` : `Failed: ${name}`;
 }
 
 function renderJob(box, job, ids, kind) {
@@ -379,9 +432,7 @@ function renderJob(box, job, ids, kind) {
     const t = modelTitle(job.target);
     title = job.state === "running" ? `Switching to ${t}` : job.state === "done" ? `Switched to ${t}` : `Couldn't switch to ${t}`;
   } else {
-    const key = job.target.replace("install:model:", "");
-    const t = modelTitle(key);
-    title = job.state === "running" ? `Installing ${t}` : job.state === "done" ? `Installed ${t}` : `Couldn't install ${t}`;
+    title = jobTitle(job);
   }
   ids.title.textContent = title;
   const end = job.finished || Date.now() / 1000;
@@ -409,9 +460,11 @@ function renderJob(box, job, ids, kind) {
   ids.note.className = `note${job.state === "failed" ? " bad" : ""}`;
   ids.note.textContent = msg || "";
 
-  const last = kind === "swap" ? lastLogLen : lastInstallLogLen;
+  const last = kind === "swap" ? lastLogLen : kind === "storage" ? stLastLogLen : lastInstallLogLen;
   if (job.log_total !== last) {
-    if (kind === "swap") lastLogLen = job.log_total; else lastInstallLogLen = job.log_total;
+    if (kind === "swap") lastLogLen = job.log_total;
+    else if (kind === "storage") stLastLogLen = job.log_total;
+    else lastInstallLogLen = job.log_total;
     writeLog(ids.log, job.log);
   }
   if (job.state === "failed") ids.logWrap.open = true;
@@ -470,6 +523,356 @@ async function confirmInstall(m) {
     poll();
   } catch (e) { toast(e.message); }
 }
+
+/* ───────────── storage: disk space, deleting models ───────────── */
+
+let storageTimer = null;
+let stLastLogLen = -1;
+
+function showDialog(d) {
+  return new Promise((resolve) => {
+    d.returnValue = "";
+    d.showModal();
+    d.addEventListener("close", function once() {
+      d.removeEventListener("close", once);
+      resolve(d.returnValue === "ok");
+    });
+  });
+}
+
+async function loadStorage(fresh) {
+  clearTimeout(storageTimer);
+  if (activeTab !== "storage") return;
+  let data, job;
+  try {
+    [data, job] = await Promise.all([api(`/api/storage${fresh ? "?fresh=1" : ""}`), api("/api/provisioning/job").then((r) => r.job)]);
+  } catch (e) {
+    if (e.status === 401) return boot();
+    toast(e.message);
+    return;
+  }
+  renderStorage(data);
+  renderStorageJob(job);
+  const busy = data.scanning || (job && job.state === "running");
+  storageTimer = setTimeout(() => loadStorage(false), busy ? 1500 : 20000);
+}
+
+$("btn-rescan").addEventListener("click", () => { toast("Measuring…"); loadStorage(true); });
+
+function renderStorageJob(job) {
+  const recent = job && (job.state === "running" || Date.now() / 1000 - (job.finished || 0) < 600);
+  renderJob($("st-job"), recent ? job : null, {
+    title: $("st-job-title"), time: $("st-job-time"), steps: $("st-job-steps"), note: $("st-job-note"),
+    log: $("st-job-log"), logWrap: $("st-job-log-wrap"),
+  }, "storage");
+}
+
+const PART_KIND = { weights: "Model weights", image: "Docker image", recipe: "Recipe (git checkout)", cache: "Caches and state" };
+
+function renderStorage(d) {
+  const adm = me && me.role === "admin";
+  const modelsBytes = d.models_total || 0;
+  const otherBytes = (d.other || []).filter((o) => o.kind !== "builder").reduce((a, o) => a + (o.bytes || 0), 0);
+  const home = Math.max(0, d.disks.findIndex((x) => x.roles.some((r) => r.label.startsWith("Hugging Face"))));
+
+  const box = $("st-disks");
+  box.replaceChildren();
+  d.disks.forEach((disk, i) => {
+    const w = el("div", "st-disk");
+    const line = el("div", "st-line");
+    line.append(rich("span", `**${disk.mount}** · ${fmtBytes(disk.used)} used of ${fmtBytes(disk.total)}`),
+      el("span", disk.free < 40e9 ? "neg" : "muted", `${fmtBytes(disk.free)} free`));
+    const models = i === home ? modelsBytes : 0, other = i === home ? otherBytes : 0;
+    const system = Math.max(0, disk.used - models - other);
+    const bar = el("div", "st-bar");
+    for (const [cls, n] of [["seg-models", models], ["seg-other", other], ["seg-system", system]]) {
+      const seg = el("i", cls);
+      seg.style.width = `${Math.min(100, n / disk.total * 100).toFixed(2)}%`;
+      bar.append(seg);
+    }
+    const legend = el("div", "st-legend");
+    legend.append(el("span", "l-models", `Models ${fmtBytes(models)}`),
+      el("span", "l-other", `Other model files ${fmtBytes(other)}`),
+      el("span", "l-system", `Everything else ${fmtBytes(system)}`));
+    w.append(line, bar, legend, el("div", "st-roles", disk.roles.map((r) => `${r.label}: ${r.path}`).join(" · ")));
+    box.append(w);
+  });
+  if (!d.disks.length) box.append(el("p", "muted", "Couldn't read the disks."));
+
+  const dock = d.docker && d.docker.Images
+    ? ` Docker images take ${fmtBytes(d.docker.Images.bytes)} (${fmtBytes(d.docker.Images.reclaimable)} of it isn't used by a container).` : "";
+  $("st-status").textContent = d.scanning ? "Measuring what each model takes… this can take a minute on a big drive."
+    : d.error ? `Couldn't finish measuring: ${d.error}`
+      : d.at ? `Measured ${fmtWhen(d.at)}.${dock}` : "";
+
+  const list = $("st-models");
+  list.replaceChildren();
+  const ms = (d.models || []).filter((m) => m.bytes > 0).sort((a, b) => b.bytes - a.bytes);
+  if (!ms.length) list.append(el("p", "muted", d.scanning || !d.at ? "Measuring…" : "No models are installed yet."));
+  const max = Math.max(1, ...ms.map((m) => m.bytes));
+  for (const m of ms) {
+    const row = el("div", "st-model");
+    const line = el("div", "line");
+    const name = el("div");
+    name.append(el("span", "name", m.title));
+    if (m.custom) name.append(document.createTextNode(" "), el("span", "chip", "Added by you"));
+    line.append(name, el("div", "size", fmtBytes(m.bytes)));
+    if (adm) {
+      const del = el("button", "btn ghost small danger", m.bytes_freed > 0 ? `Free up ${fmtBytes(m.bytes_freed)}` : "Delete…");
+      del.title = "See what would be removed before anything is.";
+      del.addEventListener("click", () => deleteModel({ key: m.key, title: m.title, custom: m.custom }));
+      line.append(del);
+    }
+    const mini = el("div", "minibar");
+    const fill = el("i");
+    fill.style.width = `${(m.bytes / max * 100).toFixed(1)}%`;
+    mini.append(fill);
+    const more = el("details");
+    more.append(el("summary", "", `${m.parts.length} thing${m.parts.length === 1 ? "" : "s"} it uses`));
+    const ul = el("ul", "st-parts");
+    for (const p of m.parts) {
+      const li = el("li");
+      const left = el("span", "", `${PART_KIND[p.kind] || p.kind}: ${p.label}`);
+      if (p.shared_with.length) left.append(el("span", "share", `also: ${p.shared_with.join(", ")}`));
+      li.append(left, el("span", "", fmtBytes(p.bytes)));
+      ul.append(li);
+    }
+    more.append(ul);
+    row.append(line, mini, more);
+    list.append(row);
+  }
+
+  const other = (d.other || []);
+  $("st-other-panel").hidden = !other.length;
+  const ob = $("st-other");
+  ob.replaceChildren();
+  for (const o of other) {
+    const row = el("div", "st-other-row");
+    const name = el("div");
+    name.append(el("div", "name", o.label));
+    name.append(el("div", "muted small", [o.kind === "hf" ? "Downloaded weights" : o.kind === "image" ? "Docker image" : "Docker", o.note].filter(Boolean).join(" · ")));
+    row.append(name, el("div", "size", fmtBytes(o.bytes)));
+    if (adm && o.removable) {
+      const rm = el("button", "btn ghost small danger", "Remove…");
+      rm.addEventListener("click", () => removeOther(o));
+      row.append(rm);
+    } else row.append(el("span"));
+    ob.append(row);
+  }
+}
+
+function listInto(box, heading, items, keep) {
+  box.replaceChildren();
+  if (!items.length) return;
+  box.append(el("h4", "", heading));
+  const ul = el("ul", "del-list");
+  for (const p of items) {
+    const li = el("li");
+    const left = el("span");
+    left.append(document.createTextNode(p.label));
+    const why = [PART_KIND[p.kind] || p.kind];
+    if (keep && p.kept_for && p.kept_for.length) why.push(`also used by ${p.kept_for.join(", ")}`);
+    left.append(el("span", "why", why.join(" · ")));
+    li.append(left, el("span", "", fmtBytes(p.bytes)));
+    ul.append(li);
+  }
+  box.append(ul);
+}
+
+async function deleteModel(m) {
+  let plan;
+  try { plan = await api(`/api/storage/plan?key=${encodeURIComponent(m.key)}`); }
+  catch (e) { return toast(e.message); }
+  const files = plan.remove.length > 0;
+  $("del-title").textContent = `${files || plan.installed ? "Delete" : "Remove"} ${plan.title}?`;
+  $("del-blockers").replaceChildren(...plan.blockers.map((b) => el("p", "note bad slim", b)));
+  $("del-intro").textContent = files
+    ? `This takes it off the box and frees about ${fmtBytes(plan.bytes)}. Its measured speed is forgotten${plan.custom ? ", it leaves the list of models," : ""} and its entry in OpenClaw's config is tidied. You can install it again later.`
+    : plan.custom ? "Nothing is downloaded for it; it only leaves the list of models." : "None of its files are on the disk, so there's nothing to free.";
+  listInto($("del-remove"), "Will be removed", plan.remove, false);
+  listInto($("del-keep"), "Stays, because another installed model uses it", plan.keep, true);
+  const ok = $("del-ok");
+  ok.disabled = plan.blockers.length > 0;
+  ok.textContent = files ? `Delete and free ${fmtBytes(plan.bytes)}` : "Remove";
+  if (!await showDialog($("del"))) return;
+  try {
+    await api("/api/models/delete", { key: m.key });
+    toast(`Deleting ${plan.title}…`);
+    lastInstallLogLen = stLastLogLen = -1;
+    if (activeTab === "storage") loadStorage(true); else poll();
+  } catch (e) { toast(e.message); }
+}
+
+async function removeOther(o) {
+  const what = o.kind === "builder" ? "Docker's build cache" : o.label;
+  const why = o.kind === "hf" ? `This deletes the downloaded weights (${fmtBytes(o.bytes)}). You can download them again later.`
+    : o.kind === "image" ? `Removes this docker image (${fmtBytes(o.bytes)}).`
+      : "Clears the layers docker keeps from earlier image builds. Nothing that's installed is affected; the next build is just slower.";
+  if (!await ask(`Remove ${what}?`, why, "Remove")) return;
+  try {
+    await api("/api/storage/remove", { kind: o.kind, name: o.name });
+    toast("Removing…");
+    stLastLogLen = -1;
+    loadStorage(true);
+  } catch (e) { toast(e.message); }
+}
+
+/* ───────────── add a model from Hugging Face ───────────── */
+
+let hfInfo = null;
+let hfUrl = "";
+let hfAction = null;
+
+$("btn-hf").addEventListener("click", () => {
+  $("hf-url").value = "";
+  $("hf-err").textContent = "";
+  $("hf-result").replaceChildren();
+  $("hf-add").hidden = true;
+  hfInfo = hfAction = null;
+  $("hf").showModal();
+  $("hf-url").focus();
+});
+$("hf-look").addEventListener("click", hfLookup);
+// Enter in any field of the form must not fall through to its first submit button ("Close").
+$("hf-form").addEventListener("keydown", (ev) => {
+  if (ev.key !== "Enter" || ev.target.tagName !== "INPUT" || ev.target.type === "checkbox") return;
+  ev.preventDefault();
+  if (ev.target.id === "hf-url") hfLookup();
+});
+
+async function hfLookup() {
+  const url = $("hf-url").value.trim();
+  $("hf-err").textContent = "";
+  $("hf-add").hidden = true;
+  $("hf-result").replaceChildren();
+  hfInfo = hfAction = null;
+  if (!url) return;
+  const look = $("hf-look");
+  look.disabled = true;
+  look.textContent = "Looking…";
+  try {
+    hfUrl = url;
+    hfInfo = await api("/api/hf/inspect", { url });
+    renderHf(hfInfo);
+  } catch (e) { $("hf-err").textContent = e.message; }
+  finally { look.disabled = false; look.textContent = "Look it up"; }
+}
+
+function renderHf(r) {
+  const box = $("hf-result");
+  box.replaceChildren();
+  const card = el("div", "hf-card");
+  card.append(el("h4", "", r.title));
+  const link = el("a", "sub", `huggingface.co/${r.repo}`);
+  link.href = `https://huggingface.co/${r.repo}`; link.target = "_blank"; link.rel = "noopener noreferrer";
+  card.append(link);
+  const kv = el("dl", "kv");
+  const row = (k, v) => { if (v) kv.append(el("dt", "", k), el("dd", "", v)); };
+  row("Format", [r.quantization || r.format, r.architecture].filter(Boolean).join(" · "));
+  row("Size", r.gguf && r.gguf.length
+    ? `${fmtBytes(r.size_bytes)} to ${fmtBytes(r.size_max_bytes)}, depending on the quantization you pick`
+    : `${fmtBytes(r.size_bytes)} in ${r.files} files`);
+  row("Context", r.context_native ? `${fmtCtx(r.context_native)} tokens (the model's own limit)` : "");
+  row("License", r.license);
+  const small = r.gguf && r.gguf.length ? " at the smallest quantization" : "";
+  row("Memory", r.memory_gib ? `about ${r.memory_gib} GiB needed${small}${r.memory_total_gib ? `, this box has ${Math.round(r.memory_total_gib)}` : ""}` : "");
+  row("Disk", `${fmtBytes(r.size_bytes)} to download${small}, ${fmtBytes(r.disk_free)} free`);
+  row("Runs on", r.profile_label || "no engine here can run it");
+  card.append(kv);
+  box.append(card);
+  for (const w of r.warnings) box.append(el("p", "note warn slim", w));
+  for (const p of r.problems) box.append(el("p", "note bad slim", p));
+
+  const add = $("hf-add");
+  if (r.catalog_key) {
+    box.append(rich("p", `**${r.catalog_title}** in the model list already runs this${r.catalog_installed ? " and it's installed." : "."}`, "note slim"));
+    add.textContent = r.catalog_installed ? "Switch to it" : `Install ${r.catalog_title}`;
+    add.hidden = false;
+    hfAction = { type: r.catalog_installed ? "switch" : "install", key: r.catalog_key };
+    return;
+  }
+  if (!r.supported) return;
+
+  const opts = el("div", "hf-opts");
+  const field = (label, input) => { const l = el("label", "", label); l.append(input); return l; };
+  const title = el("input"); title.id = "hf-title"; title.value = r.title; title.maxLength = 80;
+  opts.append(field("Name on the card", title));
+  const ctx = el("input"); ctx.id = "hf-ctx"; ctx.type = "number"; ctx.step = "1024"; ctx.min = "2048";
+  ctx.value = r.context_default; if (r.context_native) ctx.max = r.context_native;
+  opts.append(field(`Context window (tokens${r.context_native ? `, up to ${r.context_native.toLocaleString()}` : ""}) — bigger uses more memory`, ctx));
+  if (r.gguf && r.gguf.length) {
+    const sel = el("select"); sel.id = "hf-gguf";
+    for (const g of r.gguf) sel.append(Object.assign(el("option", "", `${g.label} — ${fmtBytes(g.bytes)}`), { value: g.id }));
+    sel.selectedIndex = Math.floor(r.gguf.length / 2);
+    opts.append(field("Which file", sel));
+  }
+  if (r.profile === "vllm-spark") {
+    const adv = el("details");
+    adv.append(el("summary", "", "Advanced: more vLLM arguments"));
+    const extra = el("input"); extra.id = "hf-extra"; extra.placeholder = "--tool-call-parser hermes --enable-auto-tool-choice";
+    extra.spellcheck = false;
+    adv.append(field("Extra arguments for vllm serve", extra));
+    const trust = el("input"); trust.id = "hf-trust"; trust.type = "checkbox";
+    const tl = el("label", "check"); tl.append(trust, document.createTextNode(" Let the model run its own code (trust remote code). Only for repos you trust."));
+    adv.append(tl);
+    opts.append(adv);
+  }
+  box.append(opts);
+  add.textContent = "Add and install";
+  add.hidden = false;
+  hfAction = { type: "add" };
+}
+
+$("hf-add").addEventListener("click", async (ev) => {
+  ev.preventDefault();
+  if (!hfAction || !hfInfo) return;
+  const btn = $("hf-add");
+  btn.disabled = true;
+  $("hf-err").textContent = "";
+  try {
+    if (hfAction.type === "switch") {
+      $("hf").close();
+      return confirmSwap(status.models[hfAction.key]);
+    }
+    if (hfAction.type === "install") {
+      await api("/api/models/install", { key: hfAction.key });
+    } else {
+      const body = { url: hfUrl, title: $("hf-title").value.trim(), context: +$("hf-ctx").value || undefined };
+      if ($("hf-gguf")) body.gguf = $("hf-gguf").value;
+      if ($("hf-extra")) { body.extra_args = $("hf-extra").value; body.trust_remote_code = $("hf-trust").checked; }
+      await api("/api/hf/add", body);
+    }
+    $("hf").close();
+    lastInstallLogLen = -1;
+    toast("Installing — it runs on the box by itself; you can close this page.");
+    switchTab("models");
+  } catch (e) {
+    $("hf-err").textContent = e.message;
+    poll();
+  } finally { btn.disabled = false; }
+});
+
+async function loadHfToken() {
+  try {
+    const r = await api("/api/hf/token");
+    $("hf-token-status").textContent = r.set ? `A token is set (${r.source}).` : "No token is set. Public models don't need one.";
+    $("btn-hf-token-clear").hidden = r.source !== "settings";
+  } catch (e) { if (e.status === 401) boot(); }
+}
+
+$("btn-hf-token").addEventListener("click", async () => {
+  try {
+    await api("/api/hf/token", { token: $("hf-token").value.trim() });
+    $("hf-token").value = "";
+    toast("Saved.");
+    loadHfToken();
+  } catch (e) { toast(e.message); }
+});
+
+$("btn-hf-token-clear").addEventListener("click", async () => {
+  try { await api("/api/hf/token", { token: "" }); toast("Removed."); loadHfToken(); }
+  catch (e) { toast(e.message); }
+});
 
 /* ───────────── connect ───────────── */
 
@@ -657,9 +1060,9 @@ const TOOLS = [
   { key: "claude", label: "Claude Code", build: (v) => v.anthropic ? [
     rich("p", `The model serving now also speaks the Anthropic Messages API, so Claude Code can use it:`),
     snip(`export ANTHROPIC_BASE_URL="${v.base.replace(/\/v1$/, "")}"\nexport ANTHROPIC_AUTH_TOKEN="${v.key}"\nexport ANTHROPIC_MODEL="${v.model}"\nexport NODE_EXTRA_CA_CERTS="$HOME/spark-swapper.crt"\nclaude`),
-    rich("p", "This works only while a model that speaks that API is serving (**Qwen3.8 Flash Next** on TensorFold). With other models, use an OpenAI-compatible tool."),
+    rich("p", "This works only while a model that speaks that API is serving (**Qwen3.8 Flash Next** or **Nemotron 3.5 Bolt**, both on TensorFold). With other models, use an OpenAI-compatible tool."),
   ] : [
-    rich("p", "Claude Code speaks the Anthropic Messages API. Of the models here, only **Qwen3.8 Flash Next** (TensorFold) serves it — switch to that model and this tab shows the settings."),
+    rich("p", "Claude Code speaks the Anthropic Messages API. Of the models here, **Qwen3.8 Flash Next** and **Nemotron 3.5 Bolt** (both TensorFold) serve it — switch to one of them and this tab shows the settings."),
   ] },
   { key: "openclaw", label: "OpenClaw", build: () => [
     rich("p", "Nothing to set up: whenever you switch models, Spark Swapper points OpenClaw at the new one (its primary, image, compaction and memory-flush models) and restarts the gateway."),
@@ -760,10 +1163,7 @@ function renderProvJob(job) {
   const p = $("prov-job");
   if (!job) { p.hidden = true; return; }
   p.hidden = false;
-  const name = (job.target || "").replace("install:", "").replace("model:", "model ");
-  const title = job.state === "running" ? `Installing ${name}`
-    : job.state === "done" ? `Finished: ${name}` : `Failed: ${name}`;
-  $("prov-job-title").textContent = title;
+  $("prov-job-title").textContent = jobTitle(job);
   const end = job.finished || Date.now() / 1000;
   $("prov-job-time").textContent = (job.state === "running" ? "Elapsed " : "Took ") + fmtDur(end - job.started);
   const ol = $("prov-steps");
@@ -1025,6 +1425,7 @@ $("pw-ok").addEventListener("click", async (ev) => {
 document.addEventListener("visibilitychange", () => {
   if (!document.hidden && !$("dash").hidden) {
     if (activeTab === "models") poll();
+    if (activeTab === "storage") loadStorage();
     if (activeTab === "provision") pollProvisioning();
     if (activeTab === "settings") loadUpdates();
   }

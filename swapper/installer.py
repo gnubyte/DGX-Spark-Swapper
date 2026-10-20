@@ -14,6 +14,7 @@ returns a live presence snapshot of the infrastructure actions.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -27,6 +28,7 @@ from pathlib import Path
 import fetch
 import hardware
 from engine import DEMO, FRONT_CONF, FRONT_MARK, Job, SwapFailed, key_digest, meminfo, port_open, sh
+from storage import Storage, StorageError
 
 LLAMACPP_REPO = "unslothai/llama.cpp"
 _PROGRESS = re.compile(r"\d+(\.\d+)?%|\d+(\.\d+)?\s*[KMGT]i?B/s|\bETA\b", re.I)
@@ -166,6 +168,7 @@ class Installer:
         self.cfg = engine.cfg
         self.job: Job | None = None
         self._lock = threading.Lock()
+        self.storage = Storage(engine)
 
     @property
     def platform(self) -> str:
@@ -422,7 +425,67 @@ class Installer:
         finally:
             job.finished = time.time()
             self.engine.forget_install_cache()
+            self.storage.invalidate()
             self._lock.release()
+
+    # ── removing models and what they left ──
+    def _begin_job(self, target: str, steps: list[str], work) -> Job:
+        """Run `work(job)` as the one installer job: the same lock, log and page panel as an install."""
+        if self.engine.updating():
+            raise RuntimeError("Spark Swapper is updating itself — try again in a minute.")
+        if not self._lock.acquire(blocking=False):
+            raise RuntimeError("An install or removal is already in progress.")
+        try:
+            job = Job(target, None, steps)
+            self.job = job
+            threading.Thread(target=self._run_work, args=(job, work), daemon=True).start()
+            return job
+        except Exception:
+            self._lock.release()
+            raise
+
+    def _run_work(self, job: Job, work):
+        try:
+            work(job)
+            job.state = "done"
+        except Exception as e:  # noqa: BLE001
+            msg = str(e) if isinstance(e, (SwapFailed, InstallFailed, StorageError, fetch.FetchError)) \
+                else f"{type(e).__name__}: {e}"
+            job.say(f"✗ {msg}")
+            job.error = msg
+            job.state = "failed"
+            running = next((s["key"] for s in job.steps if s["state"] == "running"), job.steps[-1]["key"])
+            job.step(running, "failed", msg)
+        finally:
+            job.finished = time.time()
+            self.engine.forget_install_cache()
+            self.storage.invalidate()
+            self._lock.release()
+
+    def begin_delete(self, key: str) -> Job:
+        """Delete a model: stop and remove its container, then its weights, images and caches that
+        no other installed model uses. Refused while it is serving or a switch is running."""
+        eng = self.engine
+        if key not in eng.models:
+            raise ValueError("unknown model")
+        plan = self.storage.plan_delete(key)
+        if plan["blockers"]:
+            raise RuntimeError(" ".join(plan["blockers"]))
+
+        def work(job: Job):
+            eng.deleting = key
+            try:
+                self.storage.delete_model(key, job)
+            finally:
+                eng.deleting = None
+        return self._begin_job(f"delete:{key}", ["scan", "remove", "refresh"], work)
+
+    def begin_remove_other(self, kind: str, name: str) -> Job:
+        """Remove something no catalog entry accounts for (an old checkpoint, an unused image, docker's build cache)."""
+        if kind not in ("hf", "image", "builder"):
+            raise ValueError("unknown kind of thing to remove")
+        return self._begin_job(f"delete-other:{kind}:{name}", ["scan", "remove", "refresh"],
+                               lambda job: self.storage.delete_other(kind, name, job))
 
     # ── running things with a live log ──
     def _stream(self, job: Job, argv: list[str], cwd: str | None = None, env: dict | None = None,
@@ -869,20 +932,85 @@ class Installer:
         if rc != 0:
             raise InstallFailed(f"Downloading {step['repo']} failed (exit {rc}).")
 
+    def _step_mkdirs(self, job: Job, m: dict, step: dict):
+        """Create cache folders as the box user, so docker doesn't create them as root when a
+        container mounts them."""
+        owner = self.engine.box_owner()
+        for p in step.get("paths", []):
+            fetch.mkdirs(Path(p), owner)
+
+    def _step_hf_snapshot(self, job: Job, m: dict, step: dict):
+        """Download a whole Hugging Face repo into the box user's HF cache (where recipes,
+        vLLM and `hf download` all look), unless some cache already holds it."""
+        repo, revision = step["repo"], step.get("revision")
+        have = self.engine.hf_status(repo, revision)
+        if have["complete"]:
+            job.say(f"{repo} is already downloaded ({have.get('hub')}) — nothing to fetch.")
+            return
+        if have["present"]:
+            job.say(f"{have['detail']}; fetching what's missing.")
+        job.say(f"Asking Hugging Face about {repo}…")
+        fetch.hf_snapshot(repo, self.engine.hf_hub(), revision=revision, token=self.engine.hf_token(),
+                          say=job.say, exclude=tuple(step.get("exclude") or fetch.DEFAULT_EXCLUDE),
+                          owner=self.engine.box_owner())
+
+    def _step_docker_build(self, job: Job, m: dict, step: dict):
+        """Build an image from a Dockerfile held in the catalog entry (a list of lines). The image
+        carries a label with a hash of what it was built from, so an updated recipe rebuilds it
+        and an unchanged one is left alone."""
+        if step.get("build"):
+            recipe = (self.engine.cfg.get("builds") or {}).get(step["build"])
+            if not recipe:
+                raise InstallFailed(f"The catalog has no build recipe called {step['build']!r}.")
+            step = {**recipe, **{k: v for k, v in step.items() if k != "build"}}
+        image = step["image"]
+        text = "\n".join(step["dockerfile"]) + "\n"
+        args = {k: str(v) for k, v in (step.get("args") or {}).items()}
+        want = hashlib.sha256((text + json.dumps(args, sort_keys=True)).encode()).hexdigest()[:12]
+        rc, have = sh(["docker", "image", "inspect", "-f", '{{index .Config.Labels "swapper.build"}}', image], timeout=30)
+        if rc == 0 and have.strip() == want:
+            job.say(f"{image} is already built from this recipe.")
+            return
+        free = shutil.disk_usage("/var/lib/docker" if Path("/var/lib/docker").exists() else "/").free
+        need = int(step.get("free_gb", 30)) * 1024**3
+        if free < need:
+            raise InstallFailed(f"Building {image} needs about {fetch.human(need)} free for the build; "
+                                f"{fetch.human(free)} is free. Delete a model you no longer use from the Storage tab.")
+        mem_need = float(step.get("mem_gb", 0))
+        avail = meminfo()["available"]
+        if mem_need and avail < mem_need:
+            raise InstallFailed(f"Building {image} compiles CUDA kernels and needs about {mem_need:.0f} GiB of free memory; "
+                                f"{avail:.0f} GiB is free (the memory is shared with the model that's serving, and running "
+                                "out freezes the box). Switch to a smaller model first, then install this one.")
+        ctx = self.engine.state_dir / "build" / want
+        ctx.mkdir(parents=True, exist_ok=True)
+        (ctx / "Dockerfile").write_text(text)
+        argv = ["docker", "build", "--tag", image, "--label", f"swapper.build={want}", "--file", str(ctx / "Dockerfile")]
+        for k, v in args.items():
+            argv += ["--build-arg", f"{k}={v}"]
+        argv.append(str(ctx))
+        job.say(f"$ docker build -t {image}   ({len(text.splitlines())}-line Dockerfile from the catalog; this can take a while)")
+        rc = self._stream(job, argv, timeout=step.get("timeout", 14400))
+        shutil.rmtree(ctx, ignore_errors=True)
+        if rc != 0:
+            raise InstallFailed(f"docker build {image} failed (exit {rc}). The log above says why.")
+
     def _step_hf_files(self, job: Job, m: dict, step: dict):
         files = m.get("files") or []
         todo = [f for f in files if not self.engine.file_verified(f["repo"], f["path"])]
         if not todo:
             job.say("All files are already downloaded and verified.")
             return
-        listings: dict[str, dict] = {}
+        token = self.engine.hf_token()
+        listings: dict[tuple, dict] = {}
         for f in todo:
-            if f["repo"] not in listings:
+            k = (f["repo"], f.get("revision"))
+            if k not in listings:
                 job.say(f"Asking Hugging Face about {f['repo']}…")
-                listings[f["repo"]] = fetch.hf_listing(f["repo"])
+                listings[k] = fetch.hf_listing(f["repo"], f.get("revision"), token)
         need = 0
         for f in todo:
-            meta = listings[f["repo"]].get(f["path"])
+            meta = listings[(f["repo"], f.get("revision"))].get(f["path"])
             if not meta:
                 raise InstallFailed(f"{f['repo']} has no file {f['path']} any more.")
             part = self.engine.local_file(f["repo"], f["path"]).with_name(Path(f["path"]).name + ".part")
@@ -894,10 +1022,11 @@ class Installer:
         if need > free - 5 * 1024**3:
             raise InstallFailed(f"Not enough disk space: {fetch.human(need)} needed, {fetch.human(free)} free.")
         for f in todo:
-            meta = listings[f["repo"]][f["path"]]
+            meta = listings[(f["repo"], f.get("revision"))][f["path"]]
             dest = self.engine.local_file(f["repo"], f["path"])
-            fetch.download(fetch.hf_url(f["repo"], f["path"]), dest, size=meta.get("size"),
-                           sha256=meta.get("sha256"), say=job.say, label=Path(f["path"]).name)
+            fetch.download(fetch.hf_url(f["repo"], f["path"], f.get("revision") or "main"), dest, size=meta.get("size"),
+                           sha256=meta.get("sha256"), say=job.say, label=Path(f["path"]).name,
+                           headers=fetch.hf_headers(token))
             marker = dest.with_name(dest.name + ".ok")
             marker.write_text(json.dumps({"size": dest.stat().st_size, "sha256": meta.get("sha256"),
                                           "repo": f["repo"], "path": f["path"], "at": time.time()}))
