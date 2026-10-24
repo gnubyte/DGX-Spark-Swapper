@@ -18,8 +18,18 @@ STATE=/var/lib/spark-swapper
 PORT=8999
 
 # ── figure out real values for the template ─────────────────────────────
-# The web user: env override, else the first non-root account with a home.
+# The web user: env override, else whoever ran sudo (the person at the keyboard, not the first folder
+# in /home — Homebrew's "linuxbrew" account sorts before most real ones), else an account that has
+# OpenClaw installed, else the first account with a home.
 USER_="${SWAPPER_USER:-}"
+if [[ -z "$USER_" && -n "${SUDO_USER:-}" && "$SUDO_USER" != root && -d "/home/$SUDO_USER" ]]; then
+  USER_="$SUDO_USER"
+fi
+if [[ -z "$USER_" ]]; then
+  for h in /home/*; do
+    [[ -x "$h/.npm-global/bin/openclaw" ]] && USER_="$(basename "$h")" && break
+  done
+fi
 if [[ -z "$USER_" ]]; then
   for h in /home/*; do
     [[ -d "$h" ]] && USER_="$(basename "$h")" && break
@@ -35,6 +45,9 @@ OC_BIN="${OPENCLAW_BIN:-}"
 for p in "/home/$USER_/.npm-global/bin/openclaw" "/usr/local/bin/openclaw" "/usr/bin/openclaw"; do
   [[ -x "$p" ]] && OC_BIN="$p" && break
 done
+if [[ -z "$OC_BIN" && "$USER_" != root ]] && command -v runuser >/dev/null; then
+  OC_BIN="$(runuser -u "$USER_" -- bash -lc 'command -v openclaw' 2>/dev/null | tail -n1 || true)"
+fi
 OC_BIN="${OC_BIN:-/home/$USER_/.npm-global/bin/openclaw}"
 
 python3 - <<'PY' || { echo "Spark Swapper needs Python 3.10 or newer." >&2; exit 1; }
@@ -44,6 +57,17 @@ PY
 
 echo "==> installing app $(cat "$SRC/swapper/VERSION" 2>/dev/null || echo '?') to $APP"
 install -d -m 0755 "$APP" "$APP/web"
+install -d -m 0700 "$CONF" "$STATE"
+# A box installed before the config moved to /etc/spark-swapper kept it next to the app. Don't let the new
+# template overwrite it: move it to /etc (where it is the site config) and keep a copy.
+if [[ -s "$APP/models.json" ]]; then
+  mkdir -p "$STATE/backups"
+  cp -p "$APP/models.json" "$STATE/backups/models.json.$(date +%Y%m%d-%H%M%S)"
+  if [[ ! -s "$CONF/models.json" ]] && ! grep -q '{{' "$APP/models.json"; then
+    echo "==> found a configuration in $APP/models.json from an older install: keeping it as $CONF/models.json"
+    install -m 0640 "$APP/models.json" "$CONF/models.json"
+  fi
+fi
 install -m 0644 "$SRC"/swapper/*.py "$APP/"
 install -m 0644 "$SRC"/swapper/models.json "$SRC"/swapper/catalog.json "$SRC"/swapper/VERSION "$APP/"
 install -m 0644 "$SRC"/swapper/web/* "$APP/web/"
@@ -69,11 +93,15 @@ if [[ ! -s "$CONF/models.json" ]]; then
   echo "==> rendering config: user=$USER_ host=$IP openclaw=$OC_BIN"
   # A fresh box gets its own API key instead of the well-known "vllm-local".
   KEY="sk-spark-$(openssl rand -hex 20)"
-  sed -e "s/{{USER}}/$USER_/g" \
-      -e "s/{{PUBLIC_HOST}}/$IP/g" \
-      -e "s/{{OPENCLAW_BIN}}/$OC_BIN/g" \
-      -e "s/\"api_key\": \"vllm-local\"/\"api_key\": \"$KEY\"/" \
-      "$APP/models.json" > "$CONF/models.json"
+  # (Not sed: a path like /home/pat/.npm-global/bin/openclaw has slashes in it.)
+  R_USER="$USER_" R_HOST="$IP" R_BIN="$OC_BIN" R_KEY="$KEY" python3 - "$APP/models.json" "$CONF/models.json" <<'PY'
+import os, sys
+text = open(sys.argv[1]).read()
+for name, var in (("{{USER}}", "R_USER"), ("{{PUBLIC_HOST}}", "R_HOST"), ("{{OPENCLAW_BIN}}", "R_BIN")):
+    text = text.replace(name, os.environ[var])
+text = text.replace('"api_key": "vllm-local"', '"api_key": "%s"' % os.environ["R_KEY"], 1)
+open(sys.argv[2], "w").write(text)
+PY
   chmod 640 "$CONF/models.json"
 else
   echo "==> keeping existing $CONF/models.json (override wins)"
