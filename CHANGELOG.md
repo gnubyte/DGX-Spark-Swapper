@@ -1,5 +1,17 @@
 # Changelog
 
+## 2.1.1
+
+- **Vision Server.** A box can replace OpenClaw with Vision Server (Vision's agent as a service, with real-time voice and
+  the memory and skills brought over from OpenClaw). When OpenClaw's gateway unit is disabled — or `"enabled": false` is
+  set in the site config's `"openclaw"` section — switching models no longer repoints OpenClaw or restarts its gateway
+  (which started it again), and neither does a rollback; Vision Server follows the serving model by itself. The footer
+  shows Vision Server's health (`"vision_port"`, default 8443) with a link to it, in place of the gateway's.
+- **The site config can't be emptied by an install any more.** `deploy/install.sh` rendered
+  `/etc/spark-swapper/models.json` with `sed`, which fails on the slashes in OpenClaw's path *after* the shell has
+  truncated the file; the service then exited on every start. It is rendered with Python now, and a config an older
+  install kept next to the app is carried over.
+
 ## 2.1.0
 
 - **New recipes.** *Nemotron 3.5 Bolt* (NVIDIA's 74B-A9B in 23 GB on TensorFold's Zig engine,

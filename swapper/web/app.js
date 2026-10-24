@@ -321,7 +321,15 @@ function render() {
   $("h-nginx").className = `dot ${front.up ? (front.enforces_key ? "ok" : "warn") : "bad"}`;
   $("h-nginx-label").textContent = front.up && !front.enforces_key ? "HTTPS front :11443 (doesn't check the key)" : "HTTPS front :11443";
   $("h-gw").className = `dot ${s.gateway ? "ok" : "bad"}`;
-  $("h-oc").textContent = s.openclaw_primary ? `OpenClaw → ${s.openclaw_primary}` : "";
+  // A box whose OpenClaw was replaced by Vision Server shows Vision Server instead of the gateway.
+  const retired = s.openclaw_in_use === false;
+  $("h-gw-wrap").hidden = retired;
+  $("h-oc").textContent = s.openclaw_primary && !retired ? `OpenClaw → ${s.openclaw_primary}` : "";
+  const vision = s.vision || { up: false, port: 8443 };
+  $("h-vision-wrap").hidden = !vision.up && !retired;
+  $("h-vision").className = `dot ${vision.up ? "ok" : "bad"}`;
+  $("h-vision-label").textContent = `Vision Server :${vision.port}`;
+  $("h-vision-wrap").href = `https://${location.hostname}:${vision.port}/`;
   const gpu = $("h-gpu");
   gpu.hidden = !s.gpu;
   if (s.gpu) gpu.textContent = `GPU may use ${Math.round(s.gpu.total_gib)} GiB`;

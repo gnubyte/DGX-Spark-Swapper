@@ -338,3 +338,5 @@ dialog.wide { width: min(640px, calc(100vw - 32px)); max-height: calc(100vh - 48
 #hf-result .note { margin: 8px 0; }
 .card .tags { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
 .neg { color: var(--bad); font-weight: 600; }
+.health-link { color: inherit; text-decoration: none; }
+.health-link:hover { text-decoration: underline; }

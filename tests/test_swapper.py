@@ -359,6 +359,23 @@ class EngineTests(TempDir):
         self.assertTrue(Engine.serves(nem, {"id": "nemotron-3.5-lightning"}))
         self.assertFalse(Engine.serves(nem, None))
 
+    def test_openclaw_switched_off_is_not_repointed(self):
+        import engine as engine_mod
+        from unittest import mock
+        binary = self.tmp / "openclaw"
+        binary.write_text("#!/bin/sh\n")
+        binary.chmod(0o755)
+        oc = dict(site()["openclaw"], bin=str(binary))
+        eng = self.make(openclaw=dict(oc, enabled=False))
+        self.assertTrue(eng.openclaw_installed())
+        self.assertFalse(eng.openclaw_in_use(), '"enabled": false switches it off')
+        for answer, in_use in [((1, "disabled"), False), ((1, "masked"), False), ((0, "enabled"), True),
+                               ((1, "Failed to get unit file state for openclaw-gateway.service: No such file"), True)]:
+            eng = self.make(openclaw=oc)
+            with mock.patch.object(engine_mod, "sh", return_value=answer):
+                self.assertEqual(eng.openclaw_in_use(), in_use, answer)
+        self.assertEqual(self.make(vision_port=9443).vision_state()["port"], 9443)
+
     def test_split_ref(self):
         self.assertEqual(Engine.split_ref("unsloth/Qwen3.8-Flash-Next-GGUF/UD-Q3_K_XL/a.gguf"),
                          ("unsloth/Qwen3.8-Flash-Next-GGUF", "UD-Q3_K_XL/a.gguf"))

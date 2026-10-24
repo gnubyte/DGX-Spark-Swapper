@@ -710,6 +710,8 @@ class Engine:
             "nginx": True if DEMO else port_open(self.cfg.get("nginx_port", 11443)),
             "front": self.front_state(),
             "gateway": True if DEMO else port_open(self.cfg["openclaw"].get("gateway_port", 18789)),
+            "openclaw_in_use": True if DEMO else self.openclaw_in_use(),
+            "vision": self.vision_state(),
             "busy": bool(self.job and self.job.state == "running"),
             "version": self.version,
             "platform": self.platform,
@@ -783,6 +785,32 @@ class Engine:
     def openclaw_installed(self) -> bool:
         oc = self.cfg.get("openclaw") or {}
         return bool(oc.get("bin")) and Path(oc["bin"]).exists()
+
+    def openclaw_in_use(self) -> bool:
+        """OpenClaw is installed and still the box's assistant: not switched off with "enabled": false in the site
+        config's "openclaw" section, and its gateway's unit not disabled. A box whose OpenClaw was replaced (by Vision
+        Server, say) keeps OpenClaw's files but disables the unit — and switching models must not start it again, which
+        repointing would (it restarts the gateway). Asked at most every 30 s."""
+        oc = self.cfg.get("openclaw") or {}
+        if oc.get("enabled") is False or not self.openclaw_installed():
+            return False
+        now = time.time()
+        cached = getattr(self, "_oc_in_use", None)
+        if cached and now - cached[0] < 30:
+            return cached[1]
+        rc, out = sh(self._as_oc_user(["systemctl", "--user", "is-enabled", oc.get("unit") or "openclaw-gateway.service"]),
+                     timeout=10)
+        state = out.strip().splitlines()[-1].strip() if out.strip() else ""
+        # Only an explicit "disabled" or "masked" counts: a gateway started some other way keeps being repointed.
+        in_use = state not in ("disabled", "masked")
+        self._oc_in_use = (now, in_use)
+        return in_use
+
+    def vision_state(self) -> dict:
+        """Vision Server on this box — the assistant that replaces OpenClaw, with real-time voice: whether its HTTPS
+        port answers. It finds the serving model by itself, so a switch needs nothing from it."""
+        port = int(self.cfg.get("vision_port", 8443))
+        return {"port": port, "up": True if DEMO else port_open(port)}
 
     def openclaw_point_to(self, key: str, job: Job):
         m = self.models[key]
@@ -1364,6 +1392,10 @@ class Engine:
             if not self.openclaw_installed():
                 job.say("OpenClaw isn't installed on this box — skipping. (Install it on the Provisioning tab.)")
                 job.step(cur, "skipped")
+            elif not self.openclaw_in_use():
+                job.say("OpenClaw is switched off on this box (its gateway is disabled) — not repointing it. "
+                        "Vision Server follows the new model by itself.")
+                job.step(cur, "skipped")
             elif self.openclaw_primary() == self.openclaw_ref(target) and already:
                 job.say("OpenClaw already points here.")
                 job.step(cur, "skipped")
@@ -1403,7 +1435,7 @@ class Engine:
                 self.stop_model(job.target, job)
             self.wait_memory(source, job)
             self.start_model(source, job)
-            if self.openclaw_installed() and self.openclaw_primary() != self.openclaw_ref(source):
+            if self.openclaw_in_use() and self.openclaw_primary() != self.openclaw_ref(source):
                 self.openclaw_point_to(source, job)
             job.step("rollback", "done")
             job.note = f"{self.models[source]['title']} was restored and is serving again."
