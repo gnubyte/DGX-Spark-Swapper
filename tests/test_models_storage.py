@@ -1069,9 +1069,24 @@ class StorageApiTests(unittest.TestCase):
         bearer = {"Authorization": f"Bearer {made['token']}"}
         self.assertEqual(self.call("/api/storage", headers=bearer)[0], 403)
         for path, body in (("/api/models/delete", {"key": "standard"}), ("/api/storage/remove", {"kind": "builder", "name": "x"}),
-                           ("/api/hf/inspect", {"url": "a/b"}), ("/api/hf/add", {"url": "a/b"}), ("/api/hf/token", {"token": ""})):
+                           ("/api/hf/token", {"token": ""})):
             self.assertEqual(self.call(path, body, headers=bearer)[0], 403, path)
         self.assertEqual(self.call("/api/storage/plan?key=standard", headers=bearer)[0], 403)
+
+    def test_an_admins_app_connection_may_add_from_hugging_face(self):
+        cookie = self.login()
+        code, made = self.call("/api/tokens/create", {"label": "Vision Server"}, cookie=cookie)
+        bearer = {"Authorization": f"Bearer {made['token']}"}
+        # Past the connection check: a bad link is refused for what it is, before anything is fetched.
+        for path in ("/api/hf/inspect", "/api/hf/add"):
+            code, body = self.call(path, {"url": "../etc/passwd"}, headers=bearer)
+            self.assertEqual(code, 400, path)
+        # Someone else's connection is still not an admin's.
+        name = f"u{time.time_ns()}"
+        self.assertEqual(self.call("/api/users/add", {"username": name, "password": "password1"}, cookie=cookie)[0], 201)
+        user = self.login(name, "password1")
+        code, made = self.call("/api/tokens/create", {"label": "t"}, cookie=user)
+        self.assertEqual(self.call("/api/hf/inspect", {"url": "a/b"}, headers={"Authorization": f"Bearer {made['token']}"})[0], 403)
 
     def test_only_an_admin_deletes_or_adds(self):
         cookie = self.login()

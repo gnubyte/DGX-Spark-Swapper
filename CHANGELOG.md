@@ -1,5 +1,13 @@
 # Changelog
 
+## 2.1.2
+
+- **Add from Hugging Face through an app connection.** An admin's app connection (the connection code Vision Server
+  takes) may check a Hugging Face model and add it (`/api/hf/inspect`, `/api/hf/add`), so models can be added from
+  Vision's Models page. It adds them with the recipe's own launch settings only: extra launch arguments and
+  `trust_remote_code` stay with the admin signed in to this page, and app connections still can't set the Hugging Face
+  token, delete models or touch storage.
+
 ## 2.1.1
 
 - **Vision Server.** A box can replace OpenClaw with Vision Server (Vision's agent as a service, with real-time voice and

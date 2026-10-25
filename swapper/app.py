@@ -68,9 +68,12 @@ SECRET_FILE = CONF_DIR / "secret.key"
 AUTH_FILE = CONF_DIR / "users.json"
 TOKENS = tokens_mod.TokenStore(CONF_DIR / "tokens.json", persist=not DEMO)
 
-# Routes an app token may not use: it acts as its user for everything else.
+# Routes an app token may not use: it acts as its user for everything else. An admin's app connection may add a
+# model from Hugging Face (/api/hf/inspect, /api/hf/add) — Vision Server's Models page does — but never with extra
+# launch arguments or remote code (TOKEN_UNSAFE_HF), and it can't set the Hugging Face token.
 TOKEN_FORBIDDEN = ("/api/users", "/api/tokens", "/api/updates", "/api/password", "/api/setup",
-                   "/api/hf", "/api/models/delete", "/api/storage")
+                   "/api/hf/token", "/api/models/delete", "/api/storage")
+TOKEN_UNSAFE_HF = ("extra_args", "trust_remote_code")
 
 
 def _hash(password: str, salt: bytes) -> str:
@@ -568,8 +571,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(400, {"error": str(e)})
 
         if path == "/api/hf/add":
+            options = body if user.get("via") != "token" else {k: v for k, v in body.items() if k not in TOKEN_UNSAFE_HF}
             try:
-                key, entry = hfmodels.build(self.engine, str(body.get("url", "")), body)
+                key, entry = hfmodels.build(self.engine, str(body.get("url", "")), options)
                 self.engine.add_custom_model(key, entry)
             except (hfmodels.ModelError, ValueError) as e:
                 return self._json(400, {"error": str(e)})
