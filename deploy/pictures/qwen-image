@@ -67,7 +67,11 @@ def up():
 
 
 def systemctl(*args):
-    return subprocess.run(["systemctl", "--user", *args], capture_output=True, text=True)
+    # The user's systemd, also from a shell that didn't get the session's variables (a tool's, cron's).
+    uid = os.getuid()
+    env = {"XDG_RUNTIME_DIR": f"/run/user/{uid}", "DBUS_SESSION_BUS_ADDRESS": f"unix:path=/run/user/{uid}/bus",
+           **os.environ}
+    return subprocess.run(["systemctl", "--user", *args], capture_output=True, text=True, env=env)
 
 
 def ensure_running():
@@ -146,7 +150,7 @@ def generate(args):
     image = images[0]
     data = get("/view?" + urllib.parse.urlencode(
         {"filename": image["filename"], "subfolder": image.get("subfolder", ""), "type": image.get("type", "output")}), 60)
-    out = args.out or os.path.join(OUT_DIR, image["filename"])
+    out = os.path.expanduser(args.out) if args.out else os.path.join(OUT_DIR, image["filename"])  # a quoted ~ too
     os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
     with open(out, "wb") as f:
         f.write(data)
