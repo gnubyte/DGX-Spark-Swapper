@@ -16,6 +16,7 @@ need it). One swap at a time; every step is logged into the Job the web UI polls
 from __future__ import annotations
 
 import base64
+import copy
 import hashlib
 import json
 import os
@@ -165,7 +166,26 @@ STEP_LABELS = {
     "scan": "Working out what it uses",
     "remove": "Removing it",
     "refresh": "Updating the page, the disk figures and OpenClaw",
+    "context": "Saving the new context window",
+    "pictures": "Making room: pictures",
 }
+
+# The Flash Next recipe's two windows, with the recipe settings each needs. 256K is the model's native length, and the
+# smaller KV pool (HOST_RESERVE_GIB 37 instead of the recipe's 26) leaves ~11 GiB more free: room for Qwen-Image next
+# to it. 512K stretches the model with YaRN and needs the recipe's own, bigger pool, so pictures can't run alongside.
+FLASH_CONTEXTS = {
+    262144: {"label": "256K", "detail": "the model's native window — leaves room for pictures", "pictures": True,
+             "env": {"YARN": "0", "MAX_MODEL_LEN": "262144", "HOST_RESERVE_GIB": "37"}},
+    524288: {"label": "512K", "detail": "the longest chats (YaRN) — no room for pictures", "pictures": False,
+             "env": {"YARN": "1", "YARN_MAX_MODEL_LEN": "524288", "HOST_RESERVE_GIB": "26"}},
+}
+CONTEXT_ENV_KEYS = ("YARN", "MAX_MODEL_LEN", "YARN_MAX_MODEL_LEN", "HOST_RESERVE_GIB")
+
+# Qwen-Image runs in ComfyUI as the box user's qwen-image.service, started on demand by ~/.local/bin/qwen-image, which
+# refuses to start it with less than this much memory available (so it can't push the model under its watchdog's
+# floor). Spark Swapper's switch is a flag file the command reads.
+PICTURES_UNIT = "qwen-image.service"
+PICTURES_NEED_GIB = 22
 
 
 class SwapFailed(Exception):
@@ -179,8 +199,10 @@ class NotInstalled(ValueError):
 class Job:
     def __init__(self, target: str, source: str | None, steps: list[str]):
         self.id = uuid.uuid4().hex[:10]
+        self.kind = "swap"                # swap | context
         self.target = target
         self.source = source
+        self.context: int | None = None   # a context job: the window it changes to
         self.state = "running"          # running | done | failed
         self.error: str | None = None
         self.note: str | None = None
@@ -219,7 +241,7 @@ class Job:
         with self._lock:
             log = list(self.log)
         return {
-            "id": self.id, "target": self.target, "source": self.source,
+            "id": self.id, "kind": self.kind, "target": self.target, "source": self.source, "context": self.context,
             "state": self.state, "error": self.error, "note": self.note,
             "started": self.started, "finished": self.finished,
             "steps": self.steps,
@@ -250,8 +272,8 @@ class Engine:
             self.platform_evidence = "demo"
         else:
             self.platform, self.platform_evidence = hardware.detect(sh, site.get("platform"))
-        self.cfg = config_mod.merge(site, config_mod.load_json(self.catalog_path, {}) or {}, self.platform,
-                                    self.load_custom())
+        self.cfg = self._with_contexts(config_mod.merge(site, config_mod.load_json(self.catalog_path, {}) or {},
+                                                        self.platform, self.load_custom()))
         self.job: Job | None = None
         self._swap_lock = threading.Lock()
         self._state_lock = threading.Lock()
@@ -308,7 +330,55 @@ class Engine:
     def _merged(self, custom: dict) -> dict:
         """The effective config for `custom` models, from the site config this process started with (so a
         half-edited file, or a changed API key, never takes effect behind a running Swapper's back)."""
-        return config_mod.merge(self._site, config_mod.load_json(self.catalog_path, {}) or {}, self.platform, custom)
+        return self._with_contexts(config_mod.merge(self._site, config_mod.load_json(self.catalog_path, {}) or {},
+                                                    self.platform, custom))
+
+    # ── context windows chosen on the page ──
+    def context_choices(self) -> dict:
+        d = self.load_state().get("contexts")
+        return d if isinstance(d, dict) else {}
+
+    def _with_contexts(self, cfg: dict) -> dict:
+        """Each Flash Next card's chosen window (FLASH_CONTEXTS), put into a copy of the card: the recipe settings for
+        that window in its env, and the window as its context."""
+        models = cfg.get("models") or {}
+        for key, tokens in self.context_choices().items():
+            m = models.get(key)
+            profile = FLASH_CONTEXTS.get(tokens) if isinstance(tokens, int) else None
+            if not m or m.get("kind") != "flash-vllm" or not profile:
+                continue
+            m = models[key] = copy.deepcopy(m)
+            m["env"] = {**{k: v for k, v in (m.get("env") or {}).items() if k not in CONTEXT_ENV_KEYS},
+                        **profile["env"]}
+            m["context"] = tokens
+        return cfg
+
+    def _choose_context(self, key: str, tokens: int):
+        self.update_state("contexts", lambda d: {**(d if isinstance(d, dict) else {}), key: tokens})
+        self.reload_models()
+
+    # ── what changed, for the page (a small rotating file next to the state) ──
+    @property
+    def activity_file(self) -> Path:
+        return self.state_dir / "activity.log"
+
+    def activity(self, msg: str):
+        line = f"{time.strftime('%Y-%m-%d %H:%M:%S')}  {ANSI.sub('', msg).strip()}\n"
+        with self._state_lock:
+            try:
+                f = self.activity_file
+                if f.exists() and f.stat().st_size > 256 * 1024:
+                    f.write_text("".join(f.read_text(errors="replace").splitlines(keepends=True)[-500:]))
+                with f.open("a") as fh:
+                    fh.write(line)
+            except OSError:
+                pass
+
+    def activity_tail(self, n: int = 60) -> list[str]:
+        try:
+            return self.activity_file.read_text(errors="replace").splitlines()[-n:]
+        except OSError:
+            return []
 
     def _apply(self, new: dict):
         """Swap a new config in. The installer and the storage scanner keep a reference to `self.cfg`, so it is
@@ -652,6 +722,9 @@ class Engine:
             "hf_repos": self.model_hf_repos(m),
             "disk_bytes": self.disk_sizes.get(key),
             "notes": m.get("notes") or [],
+            # the windows the page can switch it between (Flash Next's recipe only)
+            "contexts": [{"tokens": t, "label": p["label"], "detail": p["detail"], "pictures": p["pictures"]}
+                         for t, p in FLASH_CONTEXTS.items()] if m["kind"] == "flash-vllm" else None,
         }
 
     @staticmethod
@@ -1410,6 +1483,8 @@ class Engine:
                     job.step(cur, "failed", str(e))
                     oc_note = f"The model is serving, but OpenClaw wasn't repointed: {e}"
             self.save_state(desired=target, last_swap={"to": target, "from": source, "at": time.time(), "ok": True})
+            self.activity(f"Switched to {self.models[target]['title']}" + (f" (from {self.models[source]['title']})"
+                                                                           if source in self.models else ""))
             job.state = "done"
             job.note = oc_note
         except Exception as e:  # noqa: BLE001 — every failure must reach the UI
@@ -1420,6 +1495,7 @@ class Engine:
             job.error = msg
             job.state = "failed"
             self.save_state(last_swap={"to": target, "from": source, "at": time.time(), "ok": False, "error": msg})
+            self.activity(f"Switching to {self.models[target]['title']} failed: {msg}")
             if source and source != target and cur in ("start", "verify", "memory"):
                 self._rollback(job, source)
         finally:
@@ -1443,6 +1519,253 @@ class Engine:
         except Exception as e:  # noqa: BLE001
             job.step("rollback", "failed", str(e))
             job.say(f"✗ Rollback failed too: {e}")
+
+    # ── the context window: 256K (room for pictures) or 512K ──
+    @staticmethod
+    def context_label(tokens: int | None) -> str:
+        p = FLASH_CONTEXTS.get(tokens) if isinstance(tokens, int) else None
+        return p["label"] if p else (f"{tokens // 1024}K" if tokens else "?")
+
+    def begin_context(self, key: str, tokens: int) -> Job | None:
+        """Serve Flash Next card `key` with `tokens` of context. The choice is saved; when that model is the one
+        serving, it restarts with it — a job like a switch (steps, a log, the old window back if the new one won't
+        start). None when there's nothing to restart: the model isn't serving (the choice applies the next time it's
+        switched to) or already serves that window."""
+        m = self.models.get(key)
+        if not m:
+            raise ValueError("Unknown model.")
+        if m.get("kind") != "flash-vllm" or tokens not in FLASH_CONTEXTS:
+            raise ValueError(f"{m['title']} can be served at {' or '.join(p['label'] for p in FLASH_CONTEXTS.values())} "
+                             "only (the Flash Next recipe's windows)." if m.get("kind") == "flash-vllm"
+                             else f"{m['title']}'s context can't be changed here.")
+        if self.updating():
+            raise RuntimeError("Spark Swapper is updating itself — try again in a minute.")
+        if self.job and self.job.state == "running":
+            raise RuntimeError("A switch is already in progress.")
+        st = self.status(fresh=True)
+        old = int(m["context"])
+        if key not in (st["active"], st["loading"]):
+            if old != tokens:
+                self._choose_context(key, tokens)
+                self.activity(f"{m['title']}: context set to {self.context_label(tokens)} — it applies the next "
+                              "time it's switched to")
+            return None
+        served = (st["models"].get(key) or {}).get("served_context")
+        if old == tokens and served == tokens:
+            return None
+        if not self._swap_lock.acquire(blocking=False):
+            raise RuntimeError("A switch is already in progress.")
+        try:
+            job = Job(key, key, ["context", "pictures", "stop", "memory", "start", "verify"])
+            job.kind, job.context = "context", tokens
+            self.job = job
+            threading.Thread(target=self._run_context, args=(job, served or old), daemon=True).start()
+            return job
+        except Exception:
+            self._swap_lock.release()
+            raise
+
+    def _run_context(self, job: Job, old: int):
+        key, tokens = job.target, job.context
+        title = self.models[key]["title"]
+        new, was = self.context_label(tokens), self.context_label(old)
+        cur = None
+        try:
+            cur = "context"; job.step(cur, "running")
+            self._choose_context(key, tokens)
+            job.say(f"{title}: {was} → {new} ({shown_env(FLASH_CONTEXTS[tokens]['env'])})")
+            self.activity(f"{title}: changing the context {was} → {new}")
+            job.step(cur, "done")
+
+            cur = "pictures"; job.step(cur, "running")
+            if not FLASH_CONTEXTS[tokens]["pictures"] and self.pictures_enabled():
+                self.set_pictures(False, by=f"the switch to {new}", job=job)
+                job.step(cur, "done", f"pictures turned off — there's no room for them next to {new}")
+            else:
+                job.step(cur, "skipped")
+
+            cur = "stop"; job.step(cur, "running")
+            self.stop_model(key, job)
+            job.step(cur, "done")
+            cur = "memory"; job.step(cur, "running")
+            self.wait_memory(key, job)
+            job.step(cur, "done")
+            cur = "start"; job.step(cur, "running")
+            self.start_model(key, job)
+            job.step(cur, "done")
+            cur = "verify"; job.step(cur, "running")
+            self.verify(key, job)
+            served = (self.served() or {}).get("context")
+            if served and served != tokens:
+                raise SwapFailed(f"The model came back serving {self.context_label(served)}, not {new}.")
+            job.say(f"Serving {new} ✓")
+            job.step(cur, "done")
+
+            self.save_state(last_context={"model": key, "to": tokens, "from": old, "at": time.time(), "ok": True})
+            self.activity(f"{title} serves {new} now")
+            job.state = "done"
+            if FLASH_CONTEXTS[tokens]["pictures"] and not self.pictures_enabled() and self.pictures_installed():
+                job.note = "There's room for pictures now — turn them on below."
+        except Exception as e:  # noqa: BLE001 — every failure must reach the UI
+            msg = str(e) if isinstance(e, SwapFailed) else f"{type(e).__name__}: {e}"
+            job.say(f"✗ {msg}")
+            if cur:
+                job.step(cur, "failed", msg)
+            job.error = msg
+            job.state = "failed"
+            self.save_state(last_context={"model": key, "to": tokens, "from": old, "at": time.time(), "ok": False,
+                                          "error": msg})
+            self.activity(f"{title}: changing the context to {new} failed: {msg}")
+            if cur in ("memory", "start", "verify"):
+                self._context_rollback(job, key, old)
+        finally:
+            job.finished = time.time()
+            self._status_cache = None
+            self._swap_lock.release()
+
+    def _context_rollback(self, job: Job, key: str, old: int):
+        title, was = self.models[key]["title"], self.context_label(old)
+        job.step("rollback", "running")
+        job.say(f"Bringing {title} back at {was} so you are not left without a model…")
+        try:
+            self._choose_context(key, old)
+            if self.model_running(key, self.running_containers(), self.active_units()):
+                self.stop_model(key, job)
+            self.wait_memory(key, job)
+            self.start_model(key, job)
+            job.step("rollback", "done")
+            job.note = f"{title} is serving again at {was}."
+            self.activity(f"{title} is back at {was}")
+        except Exception as e:  # noqa: BLE001
+            job.step("rollback", "failed", str(e))
+            job.say(f"✗ Bringing it back failed too: {e}")
+            self.activity(f"{title}: bringing it back at {was} failed too: {e}")
+
+    # ── pictures: Qwen-Image in ComfyUI (the box user's qwen-image.service, started on demand by qwen-image) ──
+    def _pictures_paths(self) -> dict:
+        home = Path(self.home)
+        return {"cli": home / ".local" / "bin" / "qwen-image",
+                "unit": home / ".config" / "systemd" / "user" / PICTURES_UNIT,
+                "flag": home / "qwen-image" / "enabled.json",
+                "stamp": home / "qwen-image" / "last-used"}
+
+    def pictures_installed(self) -> bool:
+        if DEMO:
+            return True
+        p = self._pictures_paths()
+        return p["cli"].is_file() and p["unit"].is_file()
+
+    def pictures_enabled(self) -> bool:
+        """The switch on the page. Before it was ever used: on, if pictures are installed."""
+        if DEMO:
+            return bool((self.load_state().get("demo_pictures") or {"enabled": True})["enabled"])
+        try:
+            return bool(json.loads(self._pictures_paths()["flag"].read_text()).get("enabled", True))
+        except (OSError, ValueError, AttributeError):
+            return self.pictures_installed()
+
+    def _user_systemctl(self, *args: str, timeout: float = 30) -> tuple[int, str]:
+        uid = self._uid(self.user)
+        argv, env = self.as_user(["systemctl", "--user", *args],
+                                 {"XDG_RUNTIME_DIR": f"/run/user/{uid}",
+                                  "DBUS_SESSION_BUS_ADDRESS": f"unix:path=/run/user/{uid}/bus"})
+        return sh(argv, timeout=timeout, env=env)
+
+    def _user_journal(self, lines: int = 40) -> list[str]:
+        uid = self._uid(self.user)
+        argv, env = self.as_user(["journalctl", "--user", "-u", PICTURES_UNIT, "-n", str(lines), "--no-pager",
+                                  "-o", "short-iso"], {"XDG_RUNTIME_DIR": f"/run/user/{uid}"})
+        rc, out = sh(argv, timeout=15, env=env)
+        return [ANSI.sub("", ln) for ln in out.splitlines()][-lines:] if rc == 0 else [out.strip()]
+
+    def pictures_running(self) -> bool:
+        if DEMO or not self.pictures_installed():
+            return False
+        return self._user_systemctl("is-active", PICTURES_UNIT, timeout=10)[1].strip() == "active"
+
+    def pictures_status(self, log: bool = False) -> dict:
+        """Whether pictures can be made now, and every check that says so."""
+        installed = self.pictures_installed()
+        enabled = installed and self.pictures_enabled()
+        running = installed and self.pictures_running()
+        st = self.status()
+        active = st.get("active")
+        m = self.models.get(active) if active else None
+        served = (st["models"].get(active) or {}).get("served_context") if active else None
+        room = FLASH_CONTEXTS[served]["pictures"] if m and m.get("kind") == "flash-vllm" and served in FLASH_CONTEXTS \
+            else None
+        available = float((st.get("memory") or {}).get("available") or 0)
+        try:
+            last_used = self._pictures_paths()["stamp"].stat().st_mtime if not DEMO else None
+        except OSError:
+            last_used = None
+        checks = [
+            {"key": "installed", "ok": installed,
+             "text": "qwen-image and its service are installed" if installed else
+                     "Not installed on this box (~/.local/bin/qwen-image and qwen-image.service)"},
+            {"key": "switch", "ok": enabled,
+             "text": "Turned on here" if enabled else "Turned off here — qwen-image says so instead of drawing"},
+        ]
+        if m and room is not None:
+            checks.append({"key": "context", "ok": room,
+                           "text": f"{m['title']} serves {self.context_label(served)} — there's room" if room else
+                                   f"{m['title']} serves {self.context_label(served)}: no room for pictures next to "
+                                   "it (switch to 256K)"})
+        elif not active:
+            checks.append({"key": "context", "ok": False, "text": "No model is serving"})
+        if running:
+            checks.append({"key": "memory", "ok": True,
+                           "text": f"ComfyUI is loaded (it holds ~17 GB); {available:.1f} GiB free"})
+        else:
+            checks.append({"key": "memory", "ok": available >= PICTURES_NEED_GIB,
+                           "text": f"{available:.1f} GiB free; a picture needs {PICTURES_NEED_GIB} GiB free to start"})
+        ready = all(c["ok"] for c in checks)
+        out = {
+            "installed": installed, "enabled": enabled, "running": running, "ready": ready,
+            "room": room, "available_gib": available, "need_gib": PICTURES_NEED_GIB, "last_used": last_used,
+            "unit": PICTURES_UNIT, "checks": checks,
+            "summary": ("Off" if not enabled else
+                        "Running — ComfyUI is loaded" if running else
+                        "On — starts when a picture is asked for" if ready else
+                        next(c["text"] for c in checks if not c["ok"])) if installed else "Not installed",
+        }
+        if log:
+            out["log"] = [] if DEMO or not installed else self._user_journal()
+            out["activity"] = self.activity_tail()
+        return out
+
+    def set_pictures(self, enabled: bool, by: str = "the page", job: Job | None = None) -> dict:
+        """Turn pictures on or off. Off stops ComfyUI at once (its memory goes back to the model); on only allows them —
+        ComfyUI starts when a picture is asked for."""
+        if enabled and not self.pictures_installed():
+            raise ValueError("Pictures aren't installed on this box (~/.local/bin/qwen-image).")
+        if enabled:
+            st = self.status(fresh=True)
+            active = st.get("active")
+            m = self.models.get(active) if active else None
+            served = (st["models"].get(active) or {}).get("served_context") if active else None
+            if m and m.get("kind") == "flash-vllm" and served in FLASH_CONTEXTS and not FLASH_CONTEXTS[served]["pictures"]:
+                raise RuntimeError(f"{m['title']} serves {self.context_label(served)}, which leaves no room for "
+                                   "pictures. Switch it to 256K first.")
+        say = job.say if job else (lambda _m: None)
+        flag = {"enabled": bool(enabled), "by": by, "at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
+        if DEMO:
+            self.save_state(demo_pictures=flag)
+        else:
+            path = self._pictures_paths()["flag"]
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(flag) + "\n")
+            owner = self.box_owner()
+            if owner and os.geteuid() == 0:
+                os.chown(tmp, *owner)
+            tmp.replace(path)
+            if not enabled and self.pictures_running():
+                rc, out = self._user_systemctl("stop", PICTURES_UNIT, timeout=60)
+                say(f"Stopped {PICTURES_UNIT}" if rc == 0 else f"Couldn't stop {PICTURES_UNIT}: {out.strip()}")
+        say(f"Pictures turned {'on' if enabled else 'off'}")
+        self.activity(f"Pictures turned {'on' if enabled else 'off'} ({by})")
+        return self.pictures_status()
 
     # ── boot reconcile ──
     def reconcile_at_boot(self):

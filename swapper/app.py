@@ -380,7 +380,13 @@ class Handler(BaseHTTPRequestHandler):
                                                             time.time() - (ijob.finished or 0) < 600) else None,
                 "update": {"available": upd["available"], "latest": upd["latest"],
                            "auto_install": upd["auto_install"]} if upd else None,
+                "pictures": self.engine.pictures_status(),
             })
+        if path == "/api/pictures":
+            # the checks, the service's own log and what changed lately
+            return self._json(200, self.engine.pictures_status(log=True))
+        if path == "/api/activity":
+            return self._json(200, {"lines": self.engine.activity_tail(200)})
         if path == "/api/credentials":
             return self._json(200, self.engine.credentials(self._host()))
         if path == "/api/connect":
@@ -491,6 +497,32 @@ class Handler(BaseHTTPRequestHandler):
             except RuntimeError as e:
                 return self._json(409, {"error": str(e)})
             return self._json(202, {"ok": True, "job": job.to_dict()})
+
+        if path == "/api/pictures":
+            who = f"{me} on the page" if user["via"] == "cookie" else f"{me}'s app connection"
+            try:
+                return self._json(200, {"ok": True, **self.engine.set_pictures(bool(body.get("enabled")), by=who)})
+            except ValueError as e:
+                return self._json(400, {"error": str(e)})
+            except RuntimeError as e:
+                return self._json(409, {"error": str(e)})
+
+        if path == "/api/context":
+            key = str(body.get("key", ""))
+            try:
+                tokens = int(body.get("tokens"))
+            except (TypeError, ValueError):
+                return self._json(400, {"error": "Say how many tokens: 262144 (256K) or 524288 (512K)."})
+            try:
+                job = self.engine.begin_context(key, tokens)
+            except ValueError as e:
+                return self._json(400, {"error": str(e)})
+            except RuntimeError as e:
+                return self._json(409, {"error": str(e)})
+            if job is None:   # saved for next time, or already serving that window
+                return self._json(200, {"ok": True, "restarting": False,
+                                        "context": self.engine.models[key]["context"]})
+            return self._json(202, {"ok": True, "restarting": True, "job": job.to_dict()})
 
         if path in ("/api/install", "/api/models/install"):
             action = str(body.get("action", "")) if path == "/api/install" else f"model:{body.get('key', '')}"

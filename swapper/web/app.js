@@ -267,8 +267,9 @@ function render() {
   const dot = $("now-dot");
   if (running) {
     dot.className = "pulse busy";
-    $("now-eyebrow").textContent = "Switching";
-    $("now-title").textContent = `Moving to ${modelTitle(job.target)}`;
+    const ctx = job.kind === "context";
+    $("now-eyebrow").textContent = ctx ? "Restarting" : "Switching";
+    $("now-title").textContent = ctx ? `${modelTitle(job.target)} → ${fmtCtx(job.context)}` : `Moving to ${modelTitle(job.target)}`;
     $("now-sub").textContent = "Sit back — this runs on its own. You can close this page.";
   } else if (s.active) {
     const m = s.models[s.active];
@@ -304,6 +305,7 @@ function render() {
     log: $("minstall-log"), logWrap: $("minstall-log-wrap"),
   }, "install");
   $("models-toolbar").hidden = !(me && me.role === "admin");
+  renderTuning(s, running);
 
   const disk = s.disk;
   $("disk-meter").hidden = !disk;
@@ -333,6 +335,96 @@ function render() {
   const gpu = $("h-gpu");
   gpu.hidden = !s.gpu;
   if (s.gpu) gpu.textContent = `GPU may use ${Math.round(s.gpu.total_gib)} GiB`;
+}
+
+// ── Pictures & context: the Flash Next window (256K leaves room for Qwen-Image; 512K doesn't) and pictures on/off ──
+let tuningLogAt = 0;
+
+function renderTuning(s, running) {
+  const pics = s.pictures;
+  const m = s.active ? s.models[s.active] : null;
+  const contexts = m && m.contexts;
+  const box = $("tuning");
+  box.hidden = !(contexts || (pics && pics.installed));
+  if (box.hidden) return;
+  $("tuning-sub").textContent = m ? m.title : "";
+
+  $("ctx-row").hidden = !contexts;
+  if (contexts) {
+    const served = m.served_context || m.context;
+    const seg = $("ctx-seg");
+    seg.replaceChildren();
+    for (const c of contexts) {
+      const b = el("button", `seg-btn${served === c.tokens ? " on" : ""}`, c.label);
+      b.type = "button";
+      b.title = c.detail;
+      b.disabled = running || s.busy || served === c.tokens;
+      b.addEventListener("click", () => changeContext(m, c));
+      seg.append(b);
+    }
+    const cur = contexts.find((c) => c.tokens === served);
+    $("ctx-note").textContent = cur
+      ? `${cur.label}: ${cur.detail}. Changing it restarts the model (${m.eta || "about 11 minutes"}).`
+      : `Serving ${fmtCtx(served)}.`;
+  }
+
+  $("pic-row").hidden = !pics;
+  if (pics) {
+    const t = $("pic-toggle");
+    t.checked = !!pics.enabled;
+    t.disabled = !pics.installed || running;
+    $("pic-note").textContent = pics.summary + (pics.last_used ? ` · last picture ${fmtWhen(pics.last_used)}` : "");
+    const ul = $("pic-checks");
+    ul.replaceChildren(...(pics.checks || []).map((c) => el("li", c.ok ? "ok" : "bad", c.text)));
+  }
+  if ($("tuning-log-wrap").open) loadTuningLog();
+}
+
+function writeLines(pre, lines) {
+  const atBottom = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 30;
+  pre.textContent = lines.length ? lines.join("\n") : "Nothing yet.";
+  if (atBottom) pre.scrollTop = pre.scrollHeight;
+}
+
+async function loadTuningLog(force) {
+  if (!force && Date.now() - tuningLogAt < 10000) return;   // the journal is read at most every 10 s
+  tuningLogAt = Date.now();
+  try {
+    const d = await api("/api/pictures");
+    writeLines($("tuning-activity"), d.activity || []);
+    writeLines($("tuning-log"), d.log || []);
+  } catch (e) {
+    $("tuning-log").textContent = e.message;
+  }
+}
+
+async function changeContext(m, c) {
+  const pics = status && status.pictures;
+  const off = !c.pictures && pics && pics.enabled ? " Pictures are turned off first: there's no room for them next to it." : "";
+  const ok = await ask(`Serve ${m.title} at ${c.label}?`,
+    `${c.label}: ${c.detail}. The model restarts with it (${m.eta || "about 11 minutes"}), and Vision can't answer ` +
+    `meanwhile.${off} If it won't start at ${c.label}, it comes back as it was.`, `Restart at ${c.label}`);
+  if (!ok) return;
+  try {
+    const r = await api("/api/context", { key: m.key, tokens: c.tokens });
+    toast(r.restarting ? `Restarting at ${c.label}…` : `Saved: ${c.label}`);
+  } catch (e) {
+    toast(e.message);
+  }
+  poll();
+}
+
+async function togglePictures(ev) {
+  const on = ev.target.checked;
+  try {
+    await api("/api/pictures", { enabled: on });
+    toast(on ? "Pictures are on — ComfyUI starts when one is asked for." : "Pictures are off — ComfyUI is stopped.");
+  } catch (e) {
+    ev.target.checked = !on;
+    toast(e.message);
+  }
+  tuningLogAt = 0;
+  poll();
 }
 
 function card(m, s, running, installing) {
@@ -436,7 +528,10 @@ function renderJob(box, job, ids, kind) {
   if (!job) { box.hidden = true; return; }
   box.hidden = false;
   let title;
-  if (kind === "swap") {
+  if (kind === "swap" && job.kind === "context") {
+    const t = modelTitle(job.target), c = fmtCtx(job.context);
+    title = job.state === "running" ? `Restarting ${t} at ${c}` : job.state === "done" ? `${t} serves ${c}` : `Couldn't change ${t} to ${c}`;
+  } else if (kind === "swap") {
     const t = modelTitle(job.target);
     title = job.state === "running" ? `Switching to ${t}` : job.state === "done" ? `Switched to ${t}` : `Couldn't switch to ${t}`;
   } else {
@@ -1271,6 +1366,8 @@ async function saveUpdateSettings() {
 }
 $("upd-check").addEventListener("change", saveUpdateSettings);
 $("upd-auto").addEventListener("change", saveUpdateSettings);
+$("pic-toggle").addEventListener("change", togglePictures);
+$("tuning-log-wrap").addEventListener("toggle", () => { if ($("tuning-log-wrap").open) loadTuningLog(true); });
 
 $("btn-upd-check").addEventListener("click", async () => {
   $("btn-upd-check").disabled = true;

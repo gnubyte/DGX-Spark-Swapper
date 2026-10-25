@@ -1,0 +1,6 @@
+[Unit]
+Description=Stop Qwen-Image after 15 minutes without a picture
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/qwen-image --stop-if-idle 15

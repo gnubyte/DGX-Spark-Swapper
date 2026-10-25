@@ -1,0 +1,8 @@
+[Unit]
+Description=Qwen-Image 2.1 Turbo (ComfyUI on 127.0.0.1:8188), started on demand by qwen-image
+
+[Service]
+WorkingDirectory=%h/ComfyUI
+ExecStart=%h/ComfyUI/venv/bin/python main.py --listen 127.0.0.1 --port 8188 --disable-auto-launch --output-directory %h/qwen-image/comfy-output --preview-method none
+Restart=no
+TimeoutStopSec=30

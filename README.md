@@ -195,6 +195,26 @@ folders themselves, never anything a link points at. **Other things on the disk*
 checkpoints and images that no model accounts for (such as the INT4 Flash Next checkpoint
 older recipes left) so they can be cleaned up too.
 
+### Pictures and the context window
+
+**Pictures & context** on the Models tab, while a Qwen3.8 Flash Next (vLLM) model serves:
+
+- **Context window: 256K or 512K.** 256K is the model's native window; its KV pool is smaller
+  (`HOST_RESERVE_GIB` 37 instead of the recipe's 26), which leaves ~11 GiB more free — room for
+  Qwen-Image next to it. 512K stretches the model with YaRN and takes that room back. Changing it
+  restarts the model (about 11 minutes) as a job with steps and a log; if it won't start with the new
+  window, it comes back with the old one. The choice is kept per model in the state dir, so it
+  survives restarts and updates, and applies to a model that isn't serving the next time it's
+  switched to.
+- **Pictures on/off** for Qwen-Image: ComfyUI as the box user's `qwen-image.service`, which
+  `~/.local/bin/qwen-image` starts when a picture is asked for (and refuses to start with less than
+  22 GiB free, so it can't push the model under its watchdog's floor). Off stops ComfyUI at once;
+  on is refused at 512K, and switching to 512K turns pictures off first. The checks under it say
+  what's in the way, and **Activity** shows what changed and the service's own log.
+
+`deploy/pictures/` has that setup: the `qwen-image` command (`--status` says whether a picture can be
+made now, as JSON), its units, and the ComfyUI node that loads a GGUF text encoder for Qwen-Image 2.1.
+
 ---
 
 ## Install (one click)
@@ -285,6 +305,8 @@ App tokens go in `Authorization: Bearer sst_…` on any `/api/*` call a signed-i
 make, except managing users, tokens, passwords and updates. Useful endpoints:
 `GET /api/status` (models with `installed`, `perf`, `measured`, `context`),
 `POST /api/swap {"target": key}`, `GET /api/connect`, `POST /api/models/install {"key": …}`,
+`GET /api/pictures` / `POST /api/pictures {"enabled": bool}`, `POST /api/context {"key": …, "tokens": 262144|524288}`
+(202 with a job when the model restarts) and `GET /api/activity`.
 Everything about storage (`/api/storage`), deleting models, adding one from Hugging Face and the
 Hugging Face token needs a signed-in browser session — app tokens are refused, and the changes
 are admin-only.
@@ -433,6 +455,8 @@ SWAPPER_DEMO=1 SWAPPER_DEMO_HTTP=1 SWAPPER_BIND=127.0.0.1 SWAPPER_PORT=18999 \
 - Host: `journalctl -u spark-swapper -f`
 - llama.cpp models (Strix Halo): `journalctl -u swapper-llama-<model> -f`
 - Updates: `/var/lib/spark-swapper/update.log`
+- What changed (switches, context changes, pictures on/off): `/var/lib/spark-swapper/activity.log`
+- Pictures: `journalctl --user -u qwen-image -f` (as the box user)
 - Docker: `docker logs -f spark-swapper`
 - Each recipe launch log is kept under the state dir (`/var/lib/spark-swapper/` or
   the `/state` volume).

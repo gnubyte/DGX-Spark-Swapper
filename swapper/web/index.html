@@ -100,6 +100,37 @@
           </details>
         </section>
 
+        <section class="panel" id="tuning" hidden>
+          <div class="panel-head">
+            <h2>Pictures &amp; context</h2>
+            <span class="muted small" id="tuning-sub"></span>
+          </div>
+          <div class="tune" id="ctx-row">
+            <div>
+              <div class="tune-title">Context window</div>
+              <div class="muted small" id="ctx-note"></div>
+            </div>
+            <div class="seg" id="ctx-seg" role="group" aria-label="Context window"></div>
+          </div>
+          <div class="tune" id="pic-row">
+            <div>
+              <div class="tune-title">Pictures <span class="muted">(Qwen-Image)</span></div>
+              <div class="muted small" id="pic-note"></div>
+            </div>
+            <label class="switch" title="Turn pictures on or off">
+              <input type="checkbox" id="pic-toggle"><span></span>
+            </label>
+          </div>
+          <ul class="checks" id="pic-checks"></ul>
+          <details id="tuning-log-wrap">
+            <summary>Activity and the pictures service's log</summary>
+            <h3 class="sub">What changed</h3>
+            <pre id="tuning-activity" class="log"></pre>
+            <h3 class="sub">qwen-image.service</h3>
+            <pre id="tuning-log" class="log"></pre>
+          </details>
+        </section>
+
         <section class="panel">
           <div class="panel-head">
             <h2>Keys &amp; connection</h2>

@@ -519,6 +519,93 @@ class EngineTests(TempDir):
         self.assertEqual(eng.public_host("[fe80::1]:8999"), "fe80::1")
         self.assertEqual(eng.public_host(None), "10.0.0.5")
 
+    # ── pictures & context ──
+    def serving(self, key, context, available=30.0):
+        """A status() answer with `key` serving `context` tokens."""
+        return {"active": key, "loading": None, "memory": {"available": available},
+                "models": {key: {"served_context": context}}}
+
+    def test_context_choice_rewrites_the_flash_card_and_persists(self):
+        from unittest import mock
+        eng = self.make(platform="nvidia-gb10")
+        flash = eng.models["flash"]
+        self.assertEqual(flash["context"], 524288)
+        self.assertEqual(flash["env"]["YARN"], "1")
+        with mock.patch.object(eng, "status", return_value={"active": None, "loading": None, "models": {}}):
+            self.assertIsNone(eng.begin_context("flash", 262144), "not serving: saved for next time, no restart")
+        for e in (eng, self.make(platform="nvidia-gb10")):   # and a restarted Swapper keeps it
+            flash = e.models["flash"]
+            self.assertEqual(flash["context"], 262144)
+            self.assertEqual(flash["env"]["YARN"], "0")
+            self.assertEqual(flash["env"]["MAX_MODEL_LEN"], "262144")
+            self.assertEqual(flash["env"]["HOST_RESERVE_GIB"], "37")
+            self.assertNotIn("YARN_MAX_MODEL_LEN", flash["env"])
+        self.assertEqual(json.loads(eng.config_path.read_text())["models"], {}, "the site config isn't touched")
+        self.assertRegex("\n".join(eng.activity_tail()), r"context set to 256K")
+        summary = eng.model_summary("flash", eng.models["flash"], False, False, None, {})
+        self.assertEqual([c["tokens"] for c in summary["contexts"]], [262144, 524288])
+
+    def test_context_change_is_only_for_flash_windows(self):
+        from unittest import mock
+        eng = self.make(platform="nvidia-gb10")
+        with mock.patch.object(eng, "status", return_value={"active": None, "loading": None, "models": {}}):
+            with self.assertRaisesRegex(ValueError, "256K or 512K"):
+                eng.begin_context("flash", 1000000)
+            with self.assertRaisesRegex(ValueError, "Unknown"):
+                eng.begin_context("nope", 262144)
+            other = next(k for k, m in eng.models.items() if m["kind"] != "flash-vllm")
+            with self.assertRaisesRegex(ValueError, "can't be changed"):
+                eng.begin_context(other, 262144)
+
+    def test_serving_the_same_window_restarts_nothing(self):
+        from unittest import mock
+        eng = self.make(platform="nvidia-gb10")
+        with mock.patch.object(eng, "status", return_value=self.serving("flash", 524288)):
+            self.assertIsNone(eng.begin_context("flash", 524288))
+        self.assertIsNone(eng.job)
+
+    def pictures_engine(self):
+        home = self.tmp / "home"
+        (home / ".local" / "bin").mkdir(parents=True)
+        (home / ".local" / "bin" / "qwen-image").write_text("#!/bin/sh\n")
+        (home / ".config" / "systemd" / "user").mkdir(parents=True)
+        (home / ".config" / "systemd" / "user" / "qwen-image.service").write_text("[Service]\n")
+        eng = self.make(platform="nvidia-gb10", openclaw=dict(site()["openclaw"], home=str(home)))
+        return eng, home / "qwen-image" / "enabled.json"
+
+    def test_pictures_switch_and_its_checks(self):
+        from unittest import mock
+        eng, flag = self.pictures_engine()
+        calls = []
+
+        def systemctl(*args, timeout=30):
+            calls.append(args)
+            return 0, "active" if args[0] == "is-active" else ""
+        with mock.patch.object(eng, "_user_systemctl", side_effect=systemctl), \
+                mock.patch.object(eng, "box_owner", return_value=None):
+            with mock.patch.object(eng, "status", return_value=self.serving("flash", 524288)):
+                self.assertTrue(eng.pictures_enabled(), "on until the switch is first used")
+                st = eng.pictures_status()
+                self.assertFalse(st["ready"])
+                self.assertIn("no room", next(c["text"] for c in st["checks"] if c["key"] == "context"))
+                with self.assertRaisesRegex(RuntimeError, "256K first"):
+                    eng.set_pictures(True)
+                st = eng.set_pictures(False, by="a test")
+                self.assertFalse(json.loads(flag.read_text())["enabled"])
+                self.assertIn(("stop", "qwen-image.service"), calls, "off stops ComfyUI at once")
+                self.assertEqual(st["summary"], "Off")
+            with mock.patch.object(eng, "status", return_value=self.serving("flash", 262144, available=12.0)):
+                st = eng.set_pictures(True, by="a test")
+                self.assertTrue(json.loads(flag.read_text())["enabled"])
+                self.assertTrue(st["ready"], "ComfyUI is loaded, so little free memory is fine")
+                self.assertRegex("\n".join(eng.activity_tail()), r"Pictures turned on \(a test\)")
+
+    def test_pictures_not_installed(self):
+        eng = self.make(platform="nvidia-gb10", openclaw=dict(site()["openclaw"], home=str(self.tmp / "empty")))
+        self.assertFalse(eng.pictures_installed())
+        with self.assertRaisesRegex(ValueError, "aren't installed"):
+            eng.set_pictures(True)
+
 
 # ─────────────────────────────── fetch ───────────────────────────────
 
@@ -793,6 +880,23 @@ class ApiTests(unittest.TestCase):
         cookie = self.login()
         self.assertEqual(self.call("/api/install", {"action": "rm -rf"}, cookie=cookie)[0], 400)
         self.assertEqual(self.call("/api/models/install", {"key": "nope"}, cookie=cookie)[0], 400)
+
+    def test_pictures_and_context_api(self):
+        cookie = self.login()
+        code, st, _ = self.call("/api/status", cookie=cookie)
+        self.assertEqual(code, 200)
+        self.assertIn("checks", st["pictures"])
+        code, pics, _ = self.call("/api/pictures", cookie=cookie)
+        self.assertEqual(code, 200)
+        self.assertIn("activity", pics)
+        code, off, _ = self.call("/api/pictures", {"enabled": False}, cookie=cookie)
+        self.assertEqual(code, 200)
+        self.assertFalse(off["enabled"])
+        self.assertEqual(self.call("/api/context", {"key": "nope", "tokens": 262144}, cookie=cookie)[0], 400)
+        self.assertEqual(self.call("/api/context", {"key": "flash", "tokens": "lots"}, cookie=cookie)[0], 400)
+        self.assertEqual(self.call("/api/context", {"key": "flash", "tokens": 1000}, cookie=cookie)[0], 400)
+        code, act, _ = self.call("/api/activity", cookie=cookie)
+        self.assertTrue(any("Pictures turned off" in line for line in act["lines"]))
 
 
 if __name__ == "__main__":

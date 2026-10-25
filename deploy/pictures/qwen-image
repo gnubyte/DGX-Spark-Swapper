@@ -1,0 +1,205 @@
+#!/usr/bin/env python3
+"""qwen-image: make a picture with Qwen-Image 2.1 Turbo on this Spark (ComfyUI, 127.0.0.1:8188).
+
+  qwen-image "a red fox in the snow" [--out fox.png] [--width 1024 --height 1024] [--seed N] [--negative "..."]
+  qwen-image --status               (whether a picture can be made now, and why not)
+  qwen-image --stop-if-idle 15      (the idle timer: stops ComfyUI after 15 minutes without a picture)
+
+ComfyUI runs as the user unit qwen-image.service and is started on demand. It isn't started unless enough memory is
+free, so it can never push the chat model under its watchdog's floor, nor while pictures are turned off in Spark
+Swapper (Models → Pictures & context, which writes ~/qwen-image/enabled.json). Prints one JSON line: path, width,
+height, seed, seconds — or error (exit 3: not enough memory; 4: turned off)."""
+import argparse
+import json
+import os
+import random
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+URL = "http://127.0.0.1:8188"
+UNIT = "qwen-image.service"
+HOME = os.path.expanduser("~")
+STAMP = os.path.join(HOME, "qwen-image", "last-used")
+SWITCH = os.path.join(HOME, "qwen-image", "enabled.json")   # Spark Swapper's on/off
+OUT_DIR = os.path.join(HOME, "qwen-image", "output")
+# The models take ~13.3 GiB, a 1024x1024 picture ~3 more, and the chat model's watchdog stops it below 6 GiB available.
+NEEDS_GIB = 22
+SIGMAS = "1.0, 0.978453, 0.95418, 0.926626, 0.89508, 0.845148, 0.704534, 0.414568, 0"
+
+
+def fail(message, code=1, **extra):
+    print(json.dumps({"error": message, **extra}))
+    sys.exit(code)
+
+
+def switched_on():
+    """Spark Swapper's switch; on until it's ever been used."""
+    try:
+        with open(SWITCH) as f:
+            return bool(json.load(f).get("enabled", True))
+    except (OSError, ValueError, AttributeError):
+        return True
+
+
+def mem_available_gib():
+    with open("/proc/meminfo") as f:
+        for line in f:
+            if line.startswith("MemAvailable:"):
+                return int(line.split()[1]) / 1048576
+    return 0.0
+
+
+def get(path, timeout=10):
+    with urllib.request.urlopen(URL + path, timeout=timeout) as r:
+        return r.read()
+
+
+def up():
+    try:
+        get("/system_stats", timeout=2)
+        return True
+    except (urllib.error.URLError, OSError):
+        return False
+
+
+def systemctl(*args):
+    return subprocess.run(["systemctl", "--user", *args], capture_output=True, text=True)
+
+
+def ensure_running():
+    if not switched_on():
+        fail("Pictures are turned off in Spark Swapper (Models → Pictures & context).", 4, disabled=True)
+    if up():
+        return
+    free = mem_available_gib()
+    if free < NEEDS_GIB:
+        fail(f"Not enough memory free for pictures: {free:.1f} GiB available, {NEEDS_GIB} needed. The chat model "
+             "may be serving 512K — Spark Swapper switches it to 256K.", 3, availableGib=round(free, 1),
+             needsGib=NEEDS_GIB)
+    if systemctl("start", UNIT).returncode != 0:
+        fail("Couldn't start qwen-image.service: " + systemctl("status", UNIT, "--no-pager").stdout[-400:])
+    for _ in range(180):
+        if up():
+            return
+        time.sleep(1)
+    fail("ComfyUI didn't come up within 3 minutes (journalctl --user -u qwen-image).")
+
+
+def workflow(prompt, negative, width, height, seed, prefix):
+    return {
+        "unet": {"class_type": "UNETLoader",
+                 "inputs": {"unet_name": "qwen_image_2.1_turbo_int8_convrot.safetensors", "weight_dtype": "default"}},
+        # AtomicChat's uncensored Qwen3-VL-8B (GGUF), with the stock encoder's vision tower; see
+        # ~/ComfyUI/custom_nodes/qwen_image_uncensored.
+        "clip": {"class_type": "CLIPLoaderGGUFQwenImage21",
+                 "inputs": {"clip_name": "Qwen-Image-2.1-Turbo-Uncensored-AD-Q4_K.gguf",
+                            "vision_from": "qwen3vl_8b_w4a8.safetensors"}},
+        "vae": {"class_type": "VAELoader", "inputs": {"vae_name": "qwen_image_2.1_vae_bf16.safetensors"}},
+        "encode": {"class_type": "TextEncodeQwenImage21",
+                   "inputs": {"clip": ["clip", 0], "prompt": prompt, "negative_prompt": negative, "resolution": 1024}},
+        "cache": {"class_type": "QwenImage21Cache", "inputs": {"model": ["unet", 0], "device": "auto", "dtype": "default"}},
+        "guider": {"class_type": "CFGGuider",
+                   "inputs": {"model": ["cache", 0], "positive": ["encode", 0], "negative": ["encode", 1], "cfg": 1.0}},
+        "noise": {"class_type": "RandomNoise", "inputs": {"noise_seed": seed}},
+        "sampler": {"class_type": "KSamplerSelect", "inputs": {"sampler_name": "euler"}},
+        "sigmas": {"class_type": "ManualSigmas", "inputs": {"sigmas": SIGMAS}},
+        "latent": {"class_type": "EmptyLatentImage", "inputs": {"width": width, "height": height, "batch_size": 1}},
+        "sample": {"class_type": "SamplerCustomAdvanced",
+                   "inputs": {"noise": ["noise", 0], "guider": ["guider", 0], "sampler": ["sampler", 0],
+                              "sigmas": ["sigmas", 0], "latent_image": ["latent", 0]}},
+        "decode": {"class_type": "VAEDecode", "inputs": {"samples": ["sample", 0], "vae": ["vae", 0]}},
+        "save": {"class_type": "SaveImage", "inputs": {"images": ["decode", 0], "filename_prefix": prefix}},
+    }
+
+
+def generate(args):
+    os.makedirs(os.path.dirname(STAMP), exist_ok=True)
+    seed = args.seed if args.seed is not None else random.randrange(2**48)
+    width, height = (max(256, min(2048, v // 32 * 32)) for v in (args.width, args.height))
+    started = time.time()
+    ensure_running()
+    open(STAMP, "w").close()
+    body = json.dumps({"prompt": workflow(args.prompt, args.negative, width, height, seed, "qwen-image")}).encode()
+    try:
+        req = urllib.request.Request(URL + "/prompt", body, {"Content-Type": "application/json"})
+        prompt_id = json.loads(urllib.request.urlopen(req, timeout=30).read())["prompt_id"]
+    except urllib.error.HTTPError as e:
+        fail("ComfyUI refused the workflow: " + e.read().decode(errors="replace")[:600])
+    while True:
+        time.sleep(1)
+        history = json.loads(get("/history/" + prompt_id)).get(prompt_id)
+        if not history:
+            if time.time() - started > 900:
+                fail("No picture after 15 minutes.")
+            continue
+        status = history.get("status", {})
+        if status.get("status_str") == "error":
+            messages = [m for m in status.get("messages", []) if m[0] == "execution_error"]
+            fail("ComfyUI failed: " + (messages[0][1].get("exception_message", "") if messages else "unknown error")[:600])
+        images = [i for o in history.get("outputs", {}).values() for i in o.get("images", [])]
+        if images:
+            break
+    image = images[0]
+    data = get("/view?" + urllib.parse.urlencode(
+        {"filename": image["filename"], "subfolder": image.get("subfolder", ""), "type": image.get("type", "output")}), 60)
+    out = args.out or os.path.join(OUT_DIR, image["filename"])
+    os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
+    with open(out, "wb") as f:
+        f.write(data)
+    open(STAMP, "w").close()
+    print(json.dumps({"path": os.path.abspath(out), "width": width, "height": height, "seed": seed,
+                      "seconds": round(time.time() - started, 1)}))
+
+
+def status():
+    """Can a picture be made now? For Vision, before it offers to make one."""
+    enabled, running, free = switched_on(), up(), mem_available_gib()
+    reason = ("Pictures are turned off in Spark Swapper." if not enabled else
+              None if running or free >= NEEDS_GIB else
+              f"Not enough memory free: {free:.1f} GiB available, {NEEDS_GIB} needed (the chat model may be at 512K).")
+    print(json.dumps({"ready": reason is None, "enabled": enabled, "running": running,
+                      "availableGib": round(free, 1), "needsGib": NEEDS_GIB,
+                      "lastUsed": os.path.getmtime(STAMP) if os.path.exists(STAMP) else None, "reason": reason}))
+
+
+def stop_if_idle(minutes):
+    if not up():
+        return
+    try:
+        queue = json.loads(get("/queue"))
+        if queue.get("queue_running") or queue.get("queue_pending"):
+            return
+    except (urllib.error.URLError, OSError, ValueError):
+        pass
+    last = os.path.getmtime(STAMP) if os.path.exists(STAMP) else 0
+    if time.time() - last >= minutes * 60:
+        systemctl("stop", UNIT)
+
+
+def main():
+    p = argparse.ArgumentParser(description="Make a picture with Qwen-Image 2.1 Turbo.")
+    p.add_argument("prompt", nargs="?")
+    p.add_argument("--negative", default="")
+    p.add_argument("--out")
+    p.add_argument("--width", type=int, default=1024)
+    p.add_argument("--height", type=int, default=1024)
+    p.add_argument("--seed", type=int)
+    p.add_argument("--stop-if-idle", type=float, metavar="MINUTES")
+    p.add_argument("--status", action="store_true", help="whether a picture can be made now (JSON)")
+    args = p.parse_args()
+    if args.status:
+        status()
+    elif args.stop_if_idle is not None:
+        stop_if_idle(args.stop_if_idle)
+    elif args.prompt:
+        generate(args)
+    else:
+        p.error("say what to draw")
+
+
+if __name__ == "__main__":
+    main()

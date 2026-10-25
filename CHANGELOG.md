@@ -1,5 +1,26 @@
 # Changelog
 
+## 2.2.0
+
+- **Pictures & context** (Models tab). Qwen3.8 Flash Next's recipe can serve **256K** — its native window, with a
+  smaller KV pool that leaves ~11 GiB more free, room for Qwen-Image next to it — or **512K** (YaRN, the recipe's own
+  pool, no room for pictures). The window is a per-card choice kept in the state dir (`contexts` in `state.json`) and
+  put into the card's env at load (`YARN`, `MAX_MODEL_LEN` / `YARN_MAX_MODEL_LEN`, `HOST_RESERVE_GIB`); the site config
+  isn't touched. Changing it on the serving model restarts it as a job like a switch — steps, a log, and the old
+  window back if the new one won't start; switching to 512K turns pictures off first.
+- **Pictures on/off.** A switch for Qwen-Image (ComfyUI as the box user's `qwen-image.service`, started on demand by
+  `~/.local/bin/qwen-image`): off writes `~/qwen-image/enabled.json` and stops ComfyUI at once, so its memory goes back
+  to the model; on is refused while the model serves 512K. The panel shows each check (installed, switched on, the
+  window, memory free against the 22 GiB a picture needs to start, ComfyUI loaded) and the last picture.
+- **Activity and logs.** `activity.log` in the state dir records switches, context changes and the pictures switch;
+  the panel shows it with the end of `qwen-image.service`'s journal.
+- API (sessions and app tokens): `GET /api/pictures` (status, checks, `log`, `activity`), `POST /api/pictures
+  {enabled}`, `POST /api/context {key, tokens}` (202 with a job when the model restarts; 200 when it isn't serving —
+  saved for its next switch — or already serves that window), `GET /api/activity`. `GET /api/status` carries
+  `pictures`, and each Flash Next model its `contexts`.
+- `deploy/pictures/` keeps the box's picture setup: the `qwen-image` command, its units and the ComfyUI node that loads
+  a GGUF text encoder for Qwen-Image 2.1.
+
 ## 2.1.2
 
 - **Add from Hugging Face through an app connection.** An admin's app connection (the connection code Vision Server
