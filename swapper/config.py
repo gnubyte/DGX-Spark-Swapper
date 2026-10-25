@@ -80,7 +80,8 @@ def merge(site: dict, catalog: dict, platform: str, custom: dict | None = None) 
     values = {**snippets, **values}
     cat_models = render((catalog or {}).get("models") or {}, values)
     cat_recipes = render((catalog or {}).get("recipes") or {}, values)
-    site_models = strip_legacy(site.get("models") or {}, values, load_json(LEGACY_V1, {}))
+    # Site entries take the same placeholders as the catalog ({{HOME}} in a copied entry's "dir", say).
+    site_models = render(strip_legacy(site.get("models") or {}, values, load_json(LEGACY_V1, {})), values)
     hidden = set(site.get("hidden_models") or [])
 
     models: dict[str, dict] = {}

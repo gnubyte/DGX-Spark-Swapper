@@ -797,3 +797,16 @@ class ApiTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SiteModelPlaceholderTests(unittest.TestCase):
+    def test_a_site_only_model_gets_its_placeholders_filled(self):
+        tmp = Path(tempfile.mkdtemp(prefix="swapper-test-"))
+        try:
+            entry = dict(CATALOG["models"]["flash"], title="Copy")
+            cfg = tmp / "models.json"
+            cfg.write_text(json.dumps(site(models={"flash-copy": entry})))
+            merged = config.load(cfg, ROOT / "swapper" / "catalog.json", "nvidia-gb10")
+            self.assertEqual(merged["models"]["flash-copy"]["dir"], "/home/pat/Qwen3.8-Flash-Next-Single-DGX-Spark")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
