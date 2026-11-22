@@ -60,8 +60,8 @@
       "platforms": ["nvidia-gb10"],
       "family": "qwen3.8-flash-next",
       "title": "Qwen3.8 Flash Next",
-      "tagline": "The strongest model that fits one Spark: a 125B mixture of experts on NVIDIA's FP4 checkpoint, close to full precision, with images and video.",
-      "engine": "TensorFold Zig engine · NVIDIA FP4 (QAD) · MTP drafts",
+      "tagline": "The strongest model that fits one Spark: a 125B mixture of experts on NVIDIA's FP4 checkpoint, close to full precision. Reads images (video and PDFs optional), windows up to 1M, and an abliterated option.",
+      "engine": "TensorFold v1.2.7 Zig engine · NVIDIA FP4 (QAD) · MTP drafts",
       "recommended": true,
       "kind": "recipe-script",
       "dir": "{{HOME}}/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold",
@@ -73,7 +73,80 @@
       "container": "qwen38-flash-next-tf",
       "served_id": "Qwen3.8-Flash-Next",
       "context": 262144,
+      "contexts": [
+        { "tokens": 262144, "label": "256K", "pictures": false, "min_free_gib": 108, "streams": 5,
+          "detail": "the longest window this engine serves, five chats at once — no room for pictures",
+          "env": { "CONTEXT": "262144", "PARALLEL": "5", "TENSORFOLD_MEMORY_RESERVE_GIB": "9", "MEM_FLOOR_GIB": "9" } },
+        { "tokens": 131072, "label": "128K", "pictures": true, "min_free_gib": 105, "streams": 2,
+          "detail": "two chats at once, and ~28 GiB kept free so Qwen-Image can draw beside it",
+          "env": { "CONTEXT": "131072", "PARALLEL": "2", "TENSORFOLD_MEMORY_RESERVE_GIB": "28", "MEM_FLOOR_GIB": "9" } },
+        { "tokens": 524288, "label": "512K", "pictures": false, "min_free_gib": 100, "streams": 3, "variant": "long",
+          "detail": "longer chats: YaRN ×4 on the long-context build (INT4 checkpoint, three full windows at once)",
+          "env": { "CONTEXT": "524288", "PARALLEL": "3", "TF_FLASHNEXT_YARN": "4",
+                   "CONTAINER_NAME": "qwen38-flash-next-tf-long", "STATE_DIR": "{{HOME}}/.local/state/qwen38-flash-next-tf-long",
+                   "TENSORFOLD_MEMORY_RESERVE_GIB": "10", "MEM_FLOOR_GIB": "10" } },
+        { "tokens": 1048576, "label": "1M", "pictures": false, "min_free_gib": 108, "streams": 2, "variant": "long",
+          "detail": "the longest chats: YaRN ×4 on the long-context build (INT4 checkpoint, one full 1M window, shorter chats share the rest)",
+          "env": { "CONTEXT": "1048576", "PARALLEL": "2", "TF_FLASHNEXT_YARN": "4",
+                   "CONTAINER_NAME": "qwen38-flash-next-tf-long", "STATE_DIR": "{{HOME}}/.local/state/qwen38-flash-next-tf-long",
+                   "TENSORFOLD_MEMORY_RESERVE_GIB": "10", "MEM_FLOOR_GIB": "10" } }
+      ],
+      "variants": {
+        "long": {
+          "label": "the long-context build (TensorFold db281878, INT4-AutoRound)",
+          "size_gb": 160,
+          "time": "1–2 hours: pulls or builds its engine image and downloads the ~122 GiB INT4 checkpoint",
+          "fields": {
+            "engine": "TensorFold db281878 Zig engine · INT4-AutoRound · YaRN ×4 · MTP drafts",
+            "dir": "{{HOME}}/Qwen3.8-Flash-Next-TensorFold-LongContext",
+            "container": "qwen38-flash-next-tf-long",
+            "inputs": ["images", "video"],
+            "eta": "a few minutes (loads ~66 GiB of weights)",
+            "perf": {
+              "decode": 64.4, "decode_concurrent": 200.9, "concurrency": 8, "prefill": 2500.0, "estimate": true,
+              "source": "the long-context build's own sparkDash run at a 262,144-token window (greedy, thinking off): 64.4 tok/s alone, 200.9 across 8, prefill ≈2,500 tok/s. No run past 262K is published: a long prompt reads slower, and Spark Swapper measures it after the first load"
+            },
+            "install": {
+              "requires": ["git", "docker"],
+              "size_gb": 160,
+              "time": "1–2 hours: pulls or builds its engine image and downloads the ~122 GiB INT4 checkpoint",
+              "note": "A separate checkout of the recipe, pinned to its INT4 build (branch zig-int4-ar), with its own container. Needs about 160 GB of free disk; the engine build needs at least 10 GiB of free memory.",
+              "steps": [
+                { "do": "git", "url": "https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold.git",
+                  "dir": "{{HOME}}/Qwen3.8-Flash-Next-TensorFold-LongContext", "branch": "zig-int4-ar",
+                  "ref": "5b2422fbe0c456e2b6c3acd077fbee13c949eefd" },
+                { "do": "run", "cmd": ["bash", "scripts/prepare.sh"], "cwd": "{{HOME}}/Qwen3.8-Flash-Next-TensorFold-LongContext",
+                  "as": "user", "timeout": 21600, "model_env": true }
+              ],
+              "ready": [
+                { "file": "{{HOME}}/Qwen3.8-Flash-Next-TensorFold-LongContext/start.sh" },
+                { "file": "{{HOME}}/.local/state/qwen38-flash-next-tf-long/prepared" }
+              ]
+            }
+          }
+        }
+      },
+      "switches": [
+        { "name": "ablit", "label": "Abliterated", "default": false, "admin_only": true, "needs_hf_token": true,
+          "gated_repo": "drowzeys/keys-Qwen3.8-Flash-Next-NVFP4-FP4-QAD-house-qsa-L3-47",
+          "requires_file": "scripts/ablit_view.py", "name_suffix": " · abliterated",
+          "detail": "drowzeys's Keys house-qsa overlay: the 12 attention layers' output projections with the refusal direction projected out (a ~190 MB download, on the first start only). Everything else stays NVIDIA's checkpoint.",
+          "warn": "This model has had its safety refusals removed. The overlay is gated: accept its Responsible Use Agreement on Hugging Face (signed in) and save a token on the Settings tab first. The recipe has booted it, but hasn't run its accuracy or refusal checks on it yet.",
+          "on": { "ABLIT": "1" }, "off": { "ABLIT": "0" } },
+        { "name": "video", "label": "Video input", "default": false, "experimental": true, "adds_input": "video",
+          "requires_file": "patches/0005-flashnext-cuda-video.patch",
+          "detail": "video parts (MP4, MOV, WebM; 2 frames a second, counted against the 50-image budget — about 50 seconds a request). The recipe builds it but hasn't run a live video request yet.",
+          "on": { "VIDEO": "1" }, "off": { "VIDEO": "0" } },
+        { "name": "pdf", "label": "PDF input", "default": false, "adds_input": "PDFs",
+          "requires_file": "tools/test_pdf_input.py",
+          "detail": "PDF document parts (OpenAI file / input_file, Anthropic document, or a data:application/pdf image_url), rendered to page images by the engine's PDFium: up to 32 MiB and 16 pages, sharing the image budget.",
+          "on": { "PDF": "1" }, "off": { "PDF": "0" } },
+        { "name": "thinking", "label": "Thinking by default", "off_label": "Quick answers by default", "default": true,
+          "detail": "the model reasons before it answers unless a request says otherwise (chat_template_kwargs enable_thinking). Off: quick answers by default.",
+          "on": { "THINKING": "1" }, "off": { "THINKING": "0" } }
+      ],
       "vision": true,
+      "inputs": ["images"],
       "anthropic_api": true,
       "min_free_gib": 108,
       "start_timeout_s": 3000,
@@ -82,24 +155,33 @@
       "openclaw_model_name": "Qwen3.8 Flash Next (TensorFold, NVIDIA FP4, MTP, 262K ctx)",
       "openclaw_context": 262144,
       "perf": {
-        "decode": 49.8, "decode_concurrent": 198.2, "concurrency": 5, "prefill": 2400.0,
-        "code": 50.9, "source": "the recipe's own tools/bench_streams.py (greedy, thinking off, 256 tokens, median of 3): 49.8 tok/s alone, 198.2 across 5. Its sparkDash run reads 46–55 alone and 132.7 across 5", "estimate": false
+        "decode": 58.5, "decode_concurrent": 230.1, "concurrency": 5, "prefill": 2300.0,
+        "code": 51.9, "source": "the recipe's own tools/bench_streams.py on the v1.2.7 build (greedy, 256 tokens, median of 3): 58.5 tok/s alone and 230.1 across 5 on prose, 51.9 and 206.8 on code; prefill 2,303–2,443 tok/s, a 200K-token prompt in 95.7 s", "estimate": false
       },
       "repo": "https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold",
+      "notes": [
+        "256K and 128K run the v1.2.7 build, which has no YaRN. 512K and 1M run the long-context build: the recipe's earlier TensorFold engine with the INT4-AutoRound checkpoint (about 10% lower general scores on its authors' harness), YaRN ×4, images and video, no abliterated or PDF. It is a separate ~160 GB install: Options… offers it. Apps keep the same model ID whichever window serves.",
+        "Images go in as image_url parts with data: URLs (JPEG or WebP, up to 50 a request); public https:// links are refused.",
+        "Installed before November 2026? Press Update recipe… below: it pulls the v1.2.7 recipe and builds its engine image (about an hour; the weights aren't downloaded again). Abliterated, video and PDF need it."
+      ],
       "footprint": {
-        "dirs": ["{{HOME}}/.cache/tensorfold-qwen38", "{{HOME}}/.local/state/qwen38-flash-next-tf"],
-        "hf": ["nvidia/Qwen3.8-Flash-Next-FP4-Local", "azampatti/Qwen3.8-Flash-Next-125B-A5B-INT4-AutoRound"],
+        "dirs": ["{{HOME}}/.cache/tensorfold-qwen38", "{{HOME}}/.local/state/qwen38-flash-next-tf",
+                 "{{HOME}}/.cache/huggingface/tensorfold-qwen38",
+                 "{{HOME}}/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold",
+                 "{{HOME}}/Qwen3.8-Flash-Next-TensorFold-LongContext", "{{HOME}}/.local/state/qwen38-flash-next-tf-long"],
+        "hf": ["nvidia/Qwen3.8-Flash-Next-FP4-Local", "azampatti/Qwen3.8-Flash-Next-125B-A5B-INT4-AutoRound",
+               "drowzeys/keys-Qwen3.8-Flash-Next-NVFP4-FP4-QAD-house-qsa-L3-47"],
         "images": ["tensorfold-qwen38", "ghcr.io/miaai-lab/qwen3.8-flash-next-single-dgx-spark-tensorfold"],
         "shared_images": ["nvcr.io/nvidia/pytorch:26.07-py3"]
       },
       "install": {
         "requires": ["git", "docker"],
         "size_gb": 140,
-        "time": "1–2 hours: pulls or builds the engine image and downloads the ~96 GiB checkpoint",
+        "time": "1–2 hours: builds the engine image (no prebuilt image is published for v1.2.7 yet) and downloads the ~96 GiB checkpoint",
         "note": "Needs about 160 GB of free disk. The engine build needs at least 10 GiB of free memory: if a large model is serving and memory is tight, it stops and says so — switch to a smaller model first, then install.",
         "steps": [
           { "do": "git", "url": "https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold.git", "dir": "{{HOME}}/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold" },
-          { "do": "run", "cmd": ["bash", "scripts/prepare.sh"], "cwd": "{{HOME}}/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold", "as": "user", "timeout": 21600 }
+          { "do": "run", "cmd": ["bash", "scripts/prepare.sh"], "cwd": "{{HOME}}/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold", "as": "user", "timeout": 21600, "model_env": true }
         ],
         "ready": [
           { "file": "{{HOME}}/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold/start.sh" },
@@ -287,6 +369,7 @@
       "served_id": "inkling-2-mini",
       "context": 262144,
       "vision": true,
+      "inputs": ["images"],
       "template_kwargs": { "reasoning_effort": "none" },
       "min_free_gib": 64,
       "start_timeout_s": 2700,
@@ -558,6 +641,14 @@
       "checkpoint": "models--Mia-AiLab--Qwen3.8-Flash-Next-NVFP4",
       "env": { "YARN": "1", "YARN_MAX_MODEL_LEN": "524288" },
       "context": 524288,
+      "contexts": [
+        { "tokens": 262144, "label": "256K", "pictures": true,
+          "detail": "the model's native window — leaves room for pictures",
+          "env": { "YARN": "0", "MAX_MODEL_LEN": "262144", "HOST_RESERVE_GIB": "37" } },
+        { "tokens": 524288, "label": "512K", "pictures": false,
+          "detail": "the longest chats (YaRN) — no room for pictures",
+          "env": { "YARN": "1", "YARN_MAX_MODEL_LEN": "524288", "HOST_RESERVE_GIB": "26" } }
+      ],
       "vision": true,
       "min_free_gib": 100,
       "start_timeout_s": 2100,

@@ -161,11 +161,20 @@ def check_password(username: str, password: str) -> bool:
     return hmac.compare_digest(_hash(password, bytes.fromhex(u["salt"])), u["hash"])
 
 
+def note_login(username: str) -> None:
+    """When `username` last signed in to the page (shown on the Users tab)."""
+    with _users_lock:
+        u = _load_users().get(username)
+        if u:
+            u["last_login"] = time.time()
+            _save_users()
+
+
 def list_users() -> list[dict]:
     out = []
     for name, u in _load_users().items():
         out.append({"username": name, "role": u.get("role", "user"),
-                    "created": u.get("created", 0)})
+                    "created": u.get("created", 0), "last_login": u.get("last_login")})
     out.sort(key=lambda x: (x["role"] != "admin", x["username"]))
     return out
 
@@ -471,6 +480,7 @@ class Handler(BaseHTTPRequestHandler):
             p = str(body.get("password", ""))
             if u and check_password(u, p):
                 throttle.ok(ip)
+                note_login(u)
                 return self._json(200, {"ok": True, "user": u, "role": user_role(u)}, self._set_session(u))
             throttle.fail(ip)
             time.sleep(0.6)
@@ -524,8 +534,58 @@ class Handler(BaseHTTPRequestHandler):
                                         "context": self.engine.models[key]["context"]})
             return self._json(202, {"ok": True, "restarting": True, "job": job.to_dict()})
 
+        if path == "/api/swap/cancel":
+            who = f"{me} on the page" if user["via"] == "cookie" else f"{me}'s app connection"
+            try:
+                job = self.engine.cancel_job(who)
+            except ValueError as e:
+                return self._json(409, {"error": str(e)})
+            return self._json(202, {"ok": True, "job": job.to_dict()})
+
+        if path == "/api/measure":
+            who = f"{me} on the page" if user["via"] == "cookie" else f"{me}'s app connection"
+            try:
+                key = self.engine.begin_measure(by=who)
+            except ValueError as e:
+                return self._json(400, {"error": str(e)})
+            except RuntimeError as e:
+                return self._json(409, {"error": str(e)})
+            return self._json(202, {"ok": True, "measuring": key})
+
+        if path == "/api/settings":
+            # A card's window and switches together: {key, context?: tokens, switches?: {name: bool}}.
+            key = str(body.get("key", ""))
+            context = body.get("context")
+            if context is not None and (isinstance(context, bool) or not isinstance(context, int)):
+                return self._json(400, {"error": "context is a number of tokens."})
+            switches = body.get("switches")
+            if switches is not None and not (isinstance(switches, dict) and len(switches) <= 16
+                                             and all(isinstance(k, str) and isinstance(v, bool)
+                                                     for k, v in switches.items())):
+                return self._json(400, {"error": "switches maps each setting's name to true or false."})
+            m = self.engine.models.get(key)
+            guarded = [s.get("label", s["name"]) for s in (self.engine.switches_of(m) if m else [])
+                       if s.get("admin_only") and (switches or {}).get(s["name"]) is True]
+            if guarded and (role != "admin" or user.get("via") == "token"):
+                # e.g. the abliterated weights: a setting that changes what the model will answer, not how fast
+                return self._json(403, {"error": f"Only an admin signed in to this page can turn on "
+                                                 f"{', '.join(guarded)}."})
+            try:
+                job = self.engine.begin_settings(key, context=context, switches=switches)
+            except ValueError as e:
+                return self._json(400, {"error": str(e)})
+            except RuntimeError as e:
+                return self._json(409, {"error": str(e)})
+            if job is None:
+                m = self.engine.models[key]
+                return self._json(200, {"ok": True, "restarting": False, "context": m["context"],
+                                        "switches": m.get("switches_on") or {}})
+            return self._json(202, {"ok": True, "restarting": True, "job": job.to_dict()})
+
         if path in ("/api/install", "/api/models/install"):
             action = str(body.get("action", "")) if path == "/api/install" else f"model:{body.get('key', '')}"
+            if path == "/api/models/install" and body.get("variant"):
+                action += f"@{body.get('variant')}"   # a card's other build (checked against ACTIONS below)
             if action not in self.installer.ACTIONS:
                 return self._json(400, {"error": "Unknown action."})
             # Infrastructure installs change the host (packages, nginx, boot settings):
@@ -695,7 +755,9 @@ class TLSServer(ThreadingHTTPServer):
 def _gen_cert():
     """Generate a self-signed cert if none exists (10 years, with SANs)."""
     import subprocess
-    host = os.uname().nodename
+    import socket
+    # os.uname is POSIX-only; the demo (and its API tests) also run on a developer's Windows or macOS machine
+    host = os.uname().nodename if hasattr(os, "uname") else socket.gethostname()
     san = [f"DNS:localhost", f"DNS:{host}", "IP:127.0.0.1"]
     try:
         out = subprocess.run(["hostname", "-I"], capture_output=True, text=True, timeout=5)

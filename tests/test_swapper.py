@@ -32,7 +32,7 @@ import fetch  # noqa: E402
 import hardware  # noqa: E402
 import tokens  # noqa: E402
 import updater  # noqa: E402
-from engine import Engine, cert_fingerprint  # noqa: E402
+from engine import Engine, Job, SwapFailed, cert_fingerprint  # noqa: E402
 from installer import InstallFailed, grub_with_gpu_limit, nginx_front_conf  # noqa: E402
 
 CATALOG = json.loads((ROOT / "swapper" / "catalog.json").read_text())
@@ -72,6 +72,44 @@ class ConfigTests(unittest.TestCase):
                 self.assertTrue(m.get("container") and m.get("docker_run"), f"{key} needs a container and docker_run")
         providers = [m["openclaw_provider"] for m in CATALOG["models"].values()]
         self.assertEqual(len(providers), len(set(providers)), "each model needs its own OpenClaw provider")
+
+    def test_windows_and_switches_are_well_formed(self):
+        # The page offers what the catalog declares, so every entry must be usable as it stands.
+        for key, m in CATALOG["models"].items():
+            contexts = m.get("contexts") or []
+            tokens = [c["tokens"] for c in contexts]
+            self.assertEqual(len(tokens), len(set(tokens)), key)
+            if contexts:
+                self.assertIn(m["context"], tokens, f"{key}: its default window must be one it offers")
+            for c in contexts:
+                self.assertIsInstance(c["tokens"], int)
+                self.assertTrue(c.get("label") and c.get("detail") and isinstance(c.get("env"), dict), key)
+                self.assertTrue(all(isinstance(v, str) for v in c["env"].values()), key)
+            names = [s["name"] for s in m.get("switches") or []]
+            self.assertEqual(len(names), len(set(names)), key)
+            for s in m.get("switches") or []:
+                self.assertTrue(re.fullmatch(r"[a-z][a-z0-9_]*", s["name"]), s["name"])
+                self.assertTrue(s.get("label") and s.get("detail"), s["name"])
+                self.assertIsInstance(s.get("default"), bool, s["name"])
+                for side in ("on", "off"):
+                    self.assertTrue(isinstance(s.get(side), dict) and all(isinstance(v, str) for v in s[side].values()),
+                                    f"{key}.{s['name']}.{side}")
+                self.assertEqual(set(s["on"]), set(s["off"]), f"{key}.{s['name']}: on and off set the same keys")
+                if s.get("needs_hf_token"):
+                    self.assertTrue(s.get("gated_repo") and s.get("admin_only"), s["name"])
+        flash = CATALOG["models"]["tfflash"]
+        for c in flash["contexts"]:
+            if c["tokens"] > 262144:   # TensorFold v1.2.7 has no YaRN: longer windows run another build
+                self.assertIn(c.get("variant"), flash["variants"], c["label"])
+                self.assertEqual(c["env"].get("TF_FLASHNEXT_YARN"), "4", c["label"])
+        for key, m in CATALOG["models"].items():
+            for c in m.get("contexts") or []:
+                if c.get("variant"):
+                    v = m["variants"][c["variant"]]
+                    self.assertTrue(v.get("label") and v["fields"]["install"]["steps"] and v["fields"]["install"]["ready"])
+                    self.assertNotEqual(v["fields"]["container"], m["container"], "each build has its own container")
+                    self.assertEqual(c["env"].get("CONTAINER_NAME"), v["fields"]["container"])
+        self.assertIn({"ABLIT": "1"}, [s["on"] for s in flash["switches"]])
 
     def test_served_ids_and_containers_are_unique_per_platform(self):
         # Which model is "serving" is decided by the id the server reports, so two models can't share one.
@@ -576,7 +614,7 @@ class EngineTests(TempDir):
                 eng.begin_context("flash", 1000000)
             with self.assertRaisesRegex(ValueError, "Unknown"):
                 eng.begin_context("nope", 262144)
-            other = next(k for k, m in eng.models.items() if m["kind"] != "flash-vllm")
+            other = next(k for k, m in eng.models.items() if not m.get("contexts"))
             with self.assertRaisesRegex(ValueError, "can't be changed"):
                 eng.begin_context(other, 262144)
 
@@ -628,6 +666,327 @@ class EngineTests(TempDir):
         self.assertFalse(eng.pictures_installed())
         with self.assertRaisesRegex(ValueError, "aren't installed"):
             eng.set_pictures(True)
+
+    # ── Flash Next on TensorFold v1.2.7: its windows and switches ──
+    def flash_tf_engine(self, recipe_files=("scripts/ablit_view.py", "tools/test_pdf_input.py",
+                                            "patches/0005-flashnext-cuda-video.patch")):
+        home = self.tmp / "home"
+        recipe = home / "Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold"
+        for f in recipe_files:
+            (recipe / f).parent.mkdir(parents=True, exist_ok=True)
+            (recipe / f).write_text("")
+        return self.make(platform="nvidia-gb10", openclaw=dict(site()["openclaw"], home=str(home)))
+
+    def not_serving(self):
+        return {"active": None, "loading": None, "models": {}}
+
+    def test_flash_next_tensorfold_defaults_are_the_recipes(self):
+        eng = self.flash_tf_engine()
+        m = eng.models["tfflash"]
+        self.assertEqual(m["context"], 262144)
+        for k, v in {"CONTEXT": "262144", "PARALLEL": "5", "TENSORFOLD_MEMORY_RESERVE_GIB": "9", "ABLIT": "0",
+                     "VIDEO": "0", "PDF": "0", "THINKING": "1", "HOST": "127.0.0.1"}.items():
+            self.assertEqual(m["env"][k], v, k)
+        self.assertEqual(m["switches_on"], {"ablit": False, "video": False, "pdf": False, "thinking": True})
+        self.assertEqual(m["inputs"], ["images"])
+        self.assertFalse(eng.needs_hf_token(m))
+        s = eng.model_summary("tfflash", m, False, False, None, {})
+        self.assertEqual([c["tokens"] for c in s["contexts"]], [262144, 131072, 524288, 1048576])
+        self.assertEqual([c["pictures"] for c in s["contexts"]], [False, True, False, False])
+        self.assertEqual([c["variant"] for c in s["contexts"]], [None, None, "long", "long"])
+        self.assertFalse(s["contexts"][3]["installed"], "the long-context build isn't installed yet")
+        self.assertIn("long-context build", s["contexts"][3]["variant_label"])
+        ablit = next(x for x in s["switches"] if x["name"] == "ablit")
+        self.assertTrue(ablit["admin_only"] and ablit["needs_hf_token"] and ablit["warn"])
+        self.assertFalse(ablit["available"], "no Hugging Face token yet")
+        self.assertIn("token", ablit["why"])
+        self.assertTrue(s["updatable"], "a git recipe can be updated in place")
+        self.assertEqual(eng.models["inkling"]["inputs"], ["images"])
+
+    def test_flash_next_settings_are_saved_for_the_next_start(self):
+        from unittest import mock
+        eng = self.flash_tf_engine()
+        eng.save_state(hf_token="hf_" + "a" * 30)
+        with mock.patch.object(eng, "status", return_value=self.not_serving()):
+            self.assertIsNone(eng.begin_settings("tfflash", context=131072, switches={"ablit": True, "pdf": True}))
+        for e in (eng, self.flash_tf_engine()):   # and a restarted Swapper keeps them
+            m = e.models["tfflash"]
+            self.assertEqual(m["context"], 131072)
+            self.assertEqual((m["env"]["CONTEXT"], m["env"]["PARALLEL"], m["env"]["TENSORFOLD_MEMORY_RESERVE_GIB"],
+                              m["env"]["MEM_FLOOR_GIB"]), ("131072", "2", "28", "9"))
+            self.assertEqual((m["env"]["ABLIT"], m["env"]["PDF"], m["env"]["VIDEO"]), ("1", "1", "0"))
+            self.assertEqual(m["inputs"], ["images", "PDFs"])
+            self.assertEqual(m["openclaw_context"], 131072, "OpenClaw is told the window it really gets")
+            self.assertEqual(m["openclaw_model_name"], "Qwen3.8 Flash Next (TensorFold, NVIDIA FP4, MTP, 128K ctx) · abliterated")
+            self.assertEqual(m["min_free_gib"], 105)
+            self.assertNotIn("decode_concurrent", m["perf"], "two chats at once: no 'across 5' figure")
+            self.assertTrue(e.needs_hf_token(m))
+        self.assertEqual(json.loads(eng.config_path.read_text())["models"], {}, "the site config isn't touched")
+        self.assertRegex("\n".join(eng.activity_tail()), r"256K → 128K, abliterated on, PDF input on")
+        # nothing else moved: the vLLM card keeps its own window
+        self.assertEqual(eng.models["flash"]["context"], 524288)
+
+    def test_flash_next_switches_are_checked(self):
+        from unittest import mock
+        eng = self.flash_tf_engine(recipe_files=())
+        with mock.patch.object(eng, "status", return_value=self.not_serving()):
+            with self.assertRaisesRegex(ValueError, "newer .* recipe"):
+                eng.begin_settings("tfflash", switches={"ablit": True})
+            eng2 = self.flash_tf_engine()
+        with mock.patch.object(eng2, "status", return_value=self.not_serving()):
+            with self.assertRaisesRegex(ValueError, "token"):
+                eng2.begin_settings("tfflash", switches={"ablit": True})
+            with self.assertRaisesRegex(ValueError, "no setting called"):
+                eng2.begin_settings("tfflash", switches={"turbo": True})
+            with self.assertRaisesRegex(ValueError, "true or false"):
+                eng2.begin_settings("tfflash", switches={"pdf": "yes"})
+            with self.assertRaisesRegex(ValueError, "256K or 128K or 512K or 1M"):
+                eng2.begin_settings("tfflash", context=393216)
+            with self.assertRaisesRegex(ValueError, "Nothing to change"):
+                eng2.begin_settings("tfflash")
+            with self.assertRaisesRegex(ValueError, "no settings"):
+                eng2.begin_settings("tf27b", switches={"ablit": True})
+            # turning a switch off is never blocked, and a switch that stays as it is changes nothing
+            self.assertIsNone(eng2.begin_settings("tfflash", switches={"thinking": False}))
+            self.assertEqual(eng2.models["tfflash"]["env"]["THINKING"], "0")
+        self.assertIsNone(eng2.job)
+
+    def test_the_token_reaches_the_recipe_only_when_a_switch_needs_it(self):
+        from unittest import mock
+        import installer as installer_mod
+        eng = self.flash_tf_engine()
+        tok = "hf_" + "b" * 30
+        eng.save_state(hf_token=tok)
+        ins = installer_mod.Installer(eng)
+        seen = []
+        with mock.patch.object(eng, "run_cmd", side_effect=lambda who, cmd, env=None: (seen.append(env) or (cmd, {}))), \
+                mock.patch.object(ins, "_stream", return_value=0):
+            step = next(s for s in eng.models["tfflash"]["install"]["steps"] if s["do"] == "run")
+            self.assertTrue(step.get("model_env"))
+            ins._step_run(Job("x", None, ["run"]), eng.models["tfflash"], step)
+            self.assertNotIn("HF_TOKEN", seen[-1])
+            self.assertEqual(seen[-1]["CONTEXT"], "262144", "prepare.sh sees the card's settings")
+            with mock.patch.object(eng, "status", return_value=self.not_serving()):
+                eng.begin_settings("tfflash", switches={"ablit": True})
+            ins._step_run(Job("x", None, ["run"]), eng.models["tfflash"], step)
+            self.assertEqual((seen[-1]["HF_TOKEN"], seen[-1]["ABLIT"]), (tok, "1"))
+
+    def test_changing_a_serving_model_restarts_it_and_rolls_back(self):
+        from unittest import mock
+        eng = self.flash_tf_engine()
+        calls = []
+        serving = {"active": "tfflash", "loading": None, "models": {"tfflash": {"served_context": None}}}
+        with mock.patch.object(eng, "status", return_value=serving), \
+                mock.patch.object(eng, "stop_model", side_effect=lambda k, j: calls.append(("stop", k))), \
+                mock.patch.object(eng, "wait_memory"), \
+                mock.patch.object(eng, "start_model",
+                                  side_effect=lambda k, j: calls.append(("start", eng.models[k]["env"]["PDF"]))), \
+                mock.patch.object(eng, "verify", side_effect=SwapFailed("no answer")), \
+                mock.patch.object(eng, "model_running", return_value=True), \
+                mock.patch.object(eng, "running_containers", return_value=set()), \
+                mock.patch.object(eng, "active_units", return_value=set()), \
+                mock.patch.object(eng, "pictures_installed", return_value=False):
+            job = eng.begin_settings("tfflash", switches={"pdf": True})
+            self.assertEqual((job.kind, job.change), ("settings", "PDF input on"))
+            for _ in range(250):
+                if job.finished:      # the rollback runs after the job is marked failed
+                    break
+                time.sleep(0.02)
+        self.assertEqual(job.state, "failed")
+        self.assertEqual(calls, [("stop", "tfflash"), ("start", "1"), ("stop", "tfflash"), ("start", "0")],
+                         "started with PDF on, then brought back as it was")
+        self.assertEqual(eng.models["tfflash"]["env"]["PDF"], "0")
+        self.assertIn("previous settings", job.note)
+
+    def install_long_build(self, eng):
+        home = Path(eng.home)
+        (home / "Qwen3.8-Flash-Next-TensorFold-LongContext").mkdir(parents=True, exist_ok=True)
+        (home / "Qwen3.8-Flash-Next-TensorFold-LongContext" / "start.sh").write_text("")
+        (home / ".local" / "state" / "qwen38-flash-next-tf-long").mkdir(parents=True, exist_ok=True)
+        (home / ".local" / "state" / "qwen38-flash-next-tf-long" / "prepared").write_text("")
+        eng.forget_install_cache()
+
+    def test_1m_runs_the_long_context_build_once_it_is_installed(self):
+        from unittest import mock
+        eng = self.flash_tf_engine()
+        (Path(eng.home) / ".local" / "state" / "qwen38-flash-next-tf").mkdir(parents=True)
+        (Path(eng.home) / ".local" / "state" / "qwen38-flash-next-tf" / "prepared").write_text("")
+        (Path(eng.home) / "Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold" / "start.sh").write_text("")
+        with mock.patch.object(eng, "status", return_value=self.not_serving()):
+            with self.assertRaisesRegex(ValueError, "isn't installed yet"):
+                eng.begin_settings("tfflash", context=1048576)
+            self.install_long_build(eng)
+            self.assertTrue(eng.variant_installed("tfflash", "long"))
+            self.assertIsNone(eng.begin_settings("tfflash", context=1048576))
+        m = eng.models["tfflash"]
+        home = eng.home
+        self.assertEqual((m["context"], m["variant"]), (1048576, "long"))
+        self.assertEqual(m["dir"], f"{home}/Qwen3.8-Flash-Next-TensorFold-LongContext")
+        self.assertEqual(m["container"], "qwen38-flash-next-tf-long")
+        self.assertEqual(m["served_id"], "Qwen3.8-Flash-Next", "apps keep the same model ID")
+        for k, v in {"CONTEXT": "1048576", "TF_FLASHNEXT_YARN": "4", "CONTAINER_NAME": "qwen38-flash-next-tf-long",
+                     "STATE_DIR": f"{home}/.local/state/qwen38-flash-next-tf-long", "PARALLEL": "2",
+                     "TENSORFOLD_API_KEY": "vllm-local", "HOST": "127.0.0.1"}.items():
+            self.assertEqual(m["env"][k], v, k)
+        self.assertEqual(m["inputs"], ["images", "video"])
+        self.assertIn("db281878", m["engine"])
+        self.assertTrue(m["openclaw_model_name"].endswith("1M ctx)"), m["openclaw_model_name"])
+        self.assertEqual(eng.install_state("tfflash", fresh=True)["installed"], True)
+        git = next(s for s in m["install"]["steps"] if s["do"] == "git")
+        self.assertEqual((git["branch"], git["ref"]), ("zig-int4-ar", "5b2422fbe0c456e2b6c3acd077fbee13c949eefd"))
+        s = eng.model_summary("tfflash", m, False, False, None, {})
+        self.assertTrue(all(c["installed"] for c in s["contexts"]), "both builds are installed")
+        ablit = next(x for x in s["switches"] if x["name"] == "ablit")
+        self.assertFalse(ablit["available"])
+        self.assertIn("long-context build", ablit["why"])
+        # and back: the v1.2.7 build, nothing of the long one left in its settings
+        with mock.patch.object(eng, "status", return_value=self.not_serving()):
+            self.assertIsNone(eng.begin_settings("tfflash", context=262144))
+        m = eng.models["tfflash"]
+        self.assertEqual((m["variant"], m["container"]), (None, "qwen38-flash-next-tf"))
+        self.assertTrue(m["dir"].endswith("Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold"))
+        for k in ("TF_FLASHNEXT_YARN", "CONTAINER_NAME", "STATE_DIR"):
+            self.assertNotIn(k, m["env"])
+
+    def test_a_switch_the_long_build_lacks_must_be_off_first(self):
+        from unittest import mock
+        eng = self.flash_tf_engine()
+        eng.save_state(hf_token="hf_" + "c" * 30)
+        self.install_long_build(eng)
+        with mock.patch.object(eng, "status", return_value=self.not_serving()):
+            eng.begin_settings("tfflash", switches={"ablit": True})
+            with self.assertRaisesRegex(ValueError, "Turn it off first"):
+                eng.begin_settings("tfflash", context=524288)
+            self.assertIsNone(eng.begin_settings("tfflash", context=524288, switches={"ablit": False}))
+        self.assertEqual(eng.models["tfflash"]["variant"], "long")
+
+    def test_the_long_build_installs_on_its_own(self):
+        from unittest import mock
+        import installer as installer_mod
+        eng = self.flash_tf_engine()
+        ins = installer_mod.Installer(eng)
+        self.assertIn("model:tfflash@long", ins.ACTIONS)
+        cmds = []
+        with mock.patch.object(eng, "run_cmd", side_effect=lambda who, cmd, env=None: (cmds.append((cmd, env)) or (cmd, {}))), \
+                mock.patch.object(ins, "_stream", side_effect=lambda job, argv, **kw: (self.install_long_build(eng) or 0)
+                                  if argv[:2] == ["bash", "scripts/prepare.sh"] else 0), \
+                mock.patch.object(ins, "check", return_value={"present": True}), \
+                mock.patch.object(eng, "ensure_docker_group"):
+            job = Job("install:model:tfflash@long", None, ["requires", "fetch", "check"])
+            ins._do_model(job, "tfflash@long")
+        clone = next(c for c, _ in cmds if c[:2] == ["git", "clone"])
+        self.assertEqual(clone[2:6], ["--depth", "50", "--branch", "zig-int4-ar"])
+        self.assertTrue(clone[-1].endswith("Qwen3.8-Flash-Next-TensorFold-LongContext"))
+        self.assertIn(["git", "-C", clone[-1], "checkout", "--detach", "5b2422fbe0c456e2b6c3acd077fbee13c949eefd"],
+                      [c for c, _ in cmds])
+        prep_env = next(e for c, e in cmds if c[:2] == ["bash", "scripts/prepare.sh"])
+        self.assertEqual((prep_env["STATE_DIR"], prep_env["TF_FLASHNEXT_YARN"]),
+                         (f"{eng.home}/.local/state/qwen38-flash-next-tf-long", "4"),
+                         "prepare.sh writes its marker where the long build's start looks")
+        self.assertEqual(eng.models["tfflash"]["variant"], None, "installing it doesn't change the window")
+
+    def test_a_restart_across_builds_stops_the_old_container_first(self):
+        from unittest import mock
+        eng = self.flash_tf_engine()
+        self.install_long_build(eng)
+        calls = []
+        serving = {"active": "tfflash", "loading": None, "models": {"tfflash": {"served_context": None}}}
+        with mock.patch.object(eng, "status", return_value=serving), \
+                mock.patch.object(eng, "stop_model", side_effect=lambda k, j: calls.append(("stop", eng.models[k]["container"]))), \
+                mock.patch.object(eng, "wait_memory"), \
+                mock.patch.object(eng, "start_model", side_effect=lambda k, j: calls.append(("start", eng.models[k]["container"]))), \
+                mock.patch.object(eng, "verify"), mock.patch.object(eng, "served", return_value=None), \
+                mock.patch.object(eng, "pictures_installed", return_value=False):
+            job = eng.begin_settings("tfflash", context=1048576)
+            for _ in range(250):
+                if job.finished:
+                    break
+                time.sleep(0.02)
+        self.assertEqual(job.state, "done", job.error)
+        self.assertEqual(calls, [("stop", "qwen38-flash-next-tf"), ("start", "qwen38-flash-next-tf-long")])
+
+    def test_a_cancelled_switch_goes_back_to_the_model_that_was_serving(self):
+        from unittest import mock
+        eng = self.make(platform="nvidia-gb10")
+        calls, started = [], threading.Event()
+
+        def wait_memory(key, job):
+            started.set()
+            for _ in range(200):          # the switch waits for memory until it's told to stop
+                eng.check_cancel(job)
+                time.sleep(0.01)
+        with mock.patch.object(eng, "preflight"), \
+                mock.patch.object(eng, "install_state", return_value={"installed": True, "detail": ""}), \
+                mock.patch.object(eng, "status", return_value={"active": "tf27b", "loading": None, "models": {}}), \
+                mock.patch.object(eng, "model_running", side_effect=lambda k, c, u: k == "tf27b" and not calls), \
+                mock.patch.object(eng, "running_containers", return_value=set()), \
+                mock.patch.object(eng, "active_units", return_value=set()), \
+                mock.patch.object(eng, "stop_model", side_effect=lambda k, j: calls.append(("stop", k))), \
+                mock.patch.object(eng, "wait_memory", side_effect=wait_memory), \
+                mock.patch.object(eng, "start_model", side_effect=lambda k, j: calls.append(("start", k))), \
+                mock.patch.object(eng, "openclaw_in_use", return_value=False):
+            job = eng.begin_swap("tfflash")
+            job.source = "tf27b"
+            self.assertTrue(started.wait(5))
+            eng.cancel_job("pat on the page")
+            self.assertTrue(job.to_dict()["cancel_requested"])
+            for _ in range(250):
+                if job.finished:
+                    break
+                time.sleep(0.02)
+        self.assertEqual(job.state, "failed")
+        self.assertIn("Cancelled by pat on the page", job.error)
+        self.assertIn(("start", "tf27b"), calls, "the model that was serving is brought back")
+        self.assertNotIn(("start", "tfflash"), calls)
+        with self.assertRaisesRegex(ValueError, "Nothing is switching"):
+            eng.cancel_job("pat")
+
+    def test_measure_again_records_the_speed(self):
+        from unittest import mock
+        eng = self.make(platform="nvidia-gb10")
+        with mock.patch.object(eng, "status", return_value={"active": None, "loading": None, "models": {}}):
+            with self.assertRaisesRegex(ValueError, "No model is serving"):
+                eng.begin_measure()
+        done = threading.Event()
+        with mock.patch.object(eng, "status", return_value={"active": "tf27b", "loading": None, "models": {}}), \
+                mock.patch.object(eng, "measure", side_effect=lambda k, job=None, usage=True:
+                                  done.wait(5) and {"decode": 61.2, "ttft": 0.3, "tokens": 256}):
+            self.assertEqual(eng.begin_measure(by="pat"), "tf27b")
+            self.assertEqual(eng.measuring, "tf27b")
+            with self.assertRaisesRegex(RuntimeError, "Already measuring"):
+                eng.begin_measure()
+            done.set()
+            for _ in range(250):
+                if not eng.measuring:
+                    break
+                time.sleep(0.02)
+        self.assertEqual(eng.load_state()["measured"]["tf27b"]["decode"], 61.2)
+        self.assertRegex("\n".join(eng.activity_tail()), r"measured again \(pat\): 61.2 tok/s")
+
+    def test_pictures_fit_beside_flash_next_tensorfold_at_128k_only(self):
+        from unittest import mock
+        eng, flag = self.pictures_engine()
+        with mock.patch.object(eng, "_user_systemctl", return_value=(0, "inactive")), \
+                mock.patch.object(eng, "box_owner", return_value=None):
+            with mock.patch.object(eng, "status", return_value=self.serving("tfflash", None)):
+                st = eng.pictures_status()
+                self.assertIn("switch to 128K", next(c["text"] for c in st["checks"] if c["key"] == "context"))
+                with self.assertRaisesRegex(RuntimeError, "Switch it to 128K"):
+                    eng.set_pictures(True)
+            with mock.patch.object(eng, "status", return_value=self.serving("tfflash", 131072, available=30.0)):
+                self.assertTrue(eng.pictures_status()["room"])
+
+    def test_connect_info_lists_what_the_guides_need(self):
+        from unittest import mock
+        eng = self.make(platform="nvidia-gb10")
+        st = {"active": "tfflash", "loading": None, "models": {
+            k: {**eng.model_summary(k, m, k == "tfflash", k == "tfflash", None, {}), "installed": k in ("tfflash", "tf27b")}
+            for k, m in eng.models.items()}}
+        with mock.patch.object(eng, "status", return_value=st):
+            info = eng.connect_info(self.tmp / "none.crt", 8999)
+        self.assertEqual(info["inputs"], ["images"])
+        self.assertEqual(info["anthropic_models"], ["Qwen3.8 Flash Next"], "installed models first")
+        self.assertEqual(info["vision_models"], ["Qwen3.8 27B", "Qwen3.8 Flash Next"])
 
 
 # ─────────────────────────────── fetch ───────────────────────────────
@@ -920,6 +1279,24 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(self.call("/api/context", {"key": "flash", "tokens": 1000}, cookie=cookie)[0], 400)
         code, act, _ = self.call("/api/activity", cookie=cookie)
         self.assertTrue(any("Pictures turned off" in line for line in act["lines"]))
+
+    def test_users_show_their_last_sign_in_and_cancel_needs_a_switch(self):
+        cookie = self.login()
+        code, users, _ = self.call("/api/users", cookie=cookie)
+        self.assertEqual(code, 200)
+        admin = next(u for u in users["users"] if u["username"] == "admin")
+        self.assertGreater(admin["last_login"], time.time() - 120)
+        self.assertEqual(self.call("/api/swap/cancel", {}, cookie=cookie)[0], 409, "nothing is switching")
+        code, body, _ = self.call("/api/models/install", {"key": "tfflash", "variant": "nope"}, cookie=cookie)
+        self.assertEqual(code, 400)
+
+    def test_settings_api_checks_its_input(self):
+        cookie = self.login()
+        self.assertEqual(self.call("/api/settings", {"key": "tfflash", "context": "big"}, cookie=cookie)[0], 400)
+        self.assertEqual(self.call("/api/settings", {"key": "tfflash", "context": True}, cookie=cookie)[0], 400)
+        self.assertEqual(self.call("/api/settings", {"key": "tfflash", "switches": {"pdf": 1}}, cookie=cookie)[0], 400)
+        self.assertEqual(self.call("/api/settings", {"key": "tfflash", "switches": ["pdf"]}, cookie=cookie)[0], 400)
+        self.assertEqual(self.call("/api/settings", {"key": "nope", "context": 131072}, cookie=cookie)[0], 400)
 
 
 if __name__ == "__main__":

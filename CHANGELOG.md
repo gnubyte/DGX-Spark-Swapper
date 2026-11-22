@@ -1,5 +1,45 @@
 # Changelog
 
+## 2.3.0
+
+- **Qwen3.8 Flash Next on TensorFold v1.2.7.** The card follows its recipe's new build: 58.5 tok/s alone and 230.1
+  across five on prose (51.9 / 206.8 on code), first tokens in less than half the time, prefill ≈2,300 tok/s. It reads
+  images (data: URLs, up to 50 a request).
+- **Longer windows on Flash Next: 512K and 1M.** TensorFold v1.2.7 has no YaRN, so those two windows run the recipe's
+  long-context build — TensorFold db281878 with the INT4-AutoRound checkpoint and YaRN ×4, pinned to its
+  `zig-int4-ar` branch — from its own checkout and container, under the same model ID. Options… installs it (~160 GB)
+  while the serving model keeps serving. A catalog window can now name such a build (`variants`), and git install
+  steps can pin a `branch` and `ref`.
+- **Model options.** *Options…* on a card sets what the model starts with: its context window and on/off settings
+  declared in the catalog (`contexts`, `switches`). A model that isn't serving keeps them for its next start; the
+  serving one restarts with them as a job, and comes back as it was if it won't start. Flash Next (TensorFold) offers:
+  - **256K or 128K**, or **512K / 1M** on the long-context build. 128K serves two chats and keeps ~28 GiB free, so
+    Qwen-Image can draw beside it.
+  - **Abliterated** (`ABLIT=1`, drowzeys's Keys house-qsa overlay; safety refusals removed). The overlay is gated: the
+    Hugging Face token from Settings goes to the recipe only while this is on, and only an admin signed in to the page
+    can turn it on.
+  - **Video input** (experimental) and **PDF input**, and **thinking by default** on or off.
+  The vLLM Flash Next card's 256K / 512K windows now come from the catalog the same way. OpenClaw is told the window
+  a model really serves after a change, not its catalog default.
+- **Update recipe…** in the Details of an installed recipe pulls its newest version and prepares it (for Flash Next:
+  the v1.2.7 engine image, about an hour, the weights aren't downloaded again). The model keeps serving meanwhile.
+- **Clearer pages.** Cards say what each model reads (*Images*, *Images & video*, *Images & PDFs*) instead of
+  "Images & video" for every vision model, and show the options set differently from the default; *Now serving*
+  says them too. The switch dialog names the window and options a model starts with. The Connect tab has an
+  **Images** guide with a ready-to-paste Python and curl example for the model serving, and its Claude Code guide
+  lists the models that speak the Anthropic API instead of naming two. Settings ▸ Hugging Face lists what needs a
+  token, with a link to each gated repo's terms. The Users tab says who may change options.
+- **Cancel a switch.** A switch or restart that is running has a Cancel button: it stops at the next safe point and
+  brings back what was serving, as a failed switch does.
+- **Measure speed** on the serving card times one reply again without a restart.
+- **Users** shows each account's last sign-in.
+- The demo, and the API tests with it, now start on Windows and macOS too (the certificate's host name no longer
+  needs `os.uname`).
+- API: `POST /api/settings {key, context?, switches?}`, `POST /api/swap/cancel`, `POST /api/measure`,
+  `POST /api/models/install {key, variant}`; models in `/api/status` carry `contexts`, `switches`,
+  `inputs` and `updatable`; `/api/connect` carries the serving model's `inputs`, `anthropic_models` and
+  `vision_models`.
+
 ## 2.2.1
 
 - **Inkling 2 Mini.** Thinking Machines' looped 26B MoE (3.4B active) in about 20 GB,

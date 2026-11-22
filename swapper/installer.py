@@ -185,7 +185,10 @@ class Installer:
     @property
     def ACTIONS(self) -> set[str]:
         models = {f"model:{k}" for k, m in self.engine.models.items() if m.get("install")}
-        return set(self.infra_actions) | models
+        # a card's other builds install on their own: "model:<key>@<variant>" (Flash Next's long-context build)
+        variants = {f"model:{k}@{v}" for k, m in self.engine.models.items() for v, x in self.engine.variants_of(m).items()
+                    if (x["fields"].get("install") or {}).get("steps")}
+        return set(self.infra_actions) | models | variants
 
     # ── config: where things live ──
     @property
@@ -395,6 +398,15 @@ class Installer:
             if action.startswith("model:"):
                 key = action.split(":", 1)[1]
                 job = Job(f"install:{action}", None, ["requires", "fetch", "check"])
+                base, _, variant = key.partition("@")
+                if variant:
+                    if self.engine.variant_installed(base, variant):
+                        job.kind = "update"
+                        job.steps[1]["label"] = "Updating the recipe and preparing it"
+                elif self.engine.install_state(key).get("installed"):
+                    # installing an installed recipe again pulls its newest version and prepares it (Update recipe…)
+                    job.kind = "update"
+                    job.steps[1]["label"] = "Updating the recipe and preparing it"
             else:
                 job = Job(f"install:{action}", None, ["run"])
                 job.steps[0]["label"] = f"Installing {INFRA.get(action, (action,))[0]}"
@@ -836,9 +848,12 @@ class Installer:
 
     # ── models ──
     def _do_model(self, job: Job, key: str, allow_infra: bool = True):
-        m = self.engine.models.get(key)
+        key, _, variant = key.partition("@")
+        m = self.engine.variant_model(key, variant) if variant else self.engine.models.get(key)
         if not m or not m.get("install"):
             raise InstallFailed("That model has no install steps.")
+        if variant:
+            m = {**m, "title": f"{m['title']} ({self.engine.variants_of(m)[variant].get('label', variant)})"}
         inst = m["install"]
         job.say(f"Installing {m['title']} — {inst.get('time', '')}".rstrip(" —"))
         job.step("requires", "running")
@@ -871,6 +886,13 @@ class Installer:
 
         job.step("check", "running")
         self.engine.forget_install_cache()
+        if variant:
+            if not self.engine.variant_installed(key, variant):
+                bad = [why for ok, why in (self.engine._ready(m, c) for c in inst.get("ready", [])) if not ok]
+                raise InstallFailed(f"{m['title']} still isn't ready: {'; '.join(bad)}.")
+            job.step("check", "done")
+            job.say(f"✓ {m['title']} is installed. Choose its window in Options… on the card.")
+            return
         st = self.engine.install_state(key, fresh=True)
         if not st["installed"]:
             raise InstallFailed(f"{m['title']} still isn't ready: {st['detail']}.")
@@ -883,6 +905,32 @@ class Installer:
     def _step_git(self, job: Job, m: dict, step: dict):
         d = Path(step["dir"])
         who = self._who(m, step)
+        branch, ref = step.get("branch"), step.get("ref")
+        if branch and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,100}", branch):
+            raise InstallFailed(f"Bad branch name in the catalog: {branch!r}")
+        if ref and not re.fullmatch(r"[0-9a-f]{7,40}", ref):
+            raise InstallFailed(f"Bad commit in the catalog: {ref!r}")
+        if ref:
+            # pinned to a commit (an older build kept for what the newest can't do): fetch it, check it out, and
+            # nothing moves until the catalog's pin does
+            if not (d / ".git").is_dir():
+                if d.exists() and any(d.iterdir()):
+                    raise InstallFailed(f"{d} exists and isn't a git checkout; move it aside and try again.")
+                job.say(f"Cloning {step['url']}{f' ({branch})' if branch else ''} → {d}")
+                argv, env = self.engine.run_cmd({"as": who}, ["git", "clone", "--depth", "50",
+                                                              *(["--branch", branch] if branch else []),
+                                                              step["url"], str(d)])
+                if self._stream(job, argv, env=env, timeout=900) != 0:
+                    raise InstallFailed("git clone failed.")
+            else:
+                argv, env = self.engine.run_cmd({"as": who}, ["git", "-C", str(d), "fetch", "--depth", "50", "origin",
+                                                              branch or ref])
+                if self._stream(job, argv, env=env, timeout=600) != 0:
+                    job.say("(couldn't fetch; checking out the pinned commit from what is here)")
+            argv, env = self.engine.run_cmd({"as": who}, ["git", "-C", str(d), "checkout", "--detach", ref])
+            if self._stream(job, argv, env=env, timeout=120) != 0:
+                raise InstallFailed(f"Couldn't check out {ref[:12]} in {d}.")
+            return
         if (d / ".git").is_dir():
             job.say(f"Updating {d}…")
             argv, env = self.engine.run_cmd({"as": who}, ["git", "-C", str(d), "pull", "--ff-only"])
@@ -906,7 +954,14 @@ class Installer:
 
     def _step_run(self, job: Job, m: dict, step: dict):
         who = self._who(m, step)
-        argv, env = self.engine.run_cmd({"as": who}, step["cmd"], step.get("env"))
+        env = dict(step.get("env") or {})
+        if step.get("model_env"):
+            # the card's own settings (its window, switches such as ABLIT=1): what the recipe prepares must be what
+            # its start script will ask for, or the first start prepares again
+            env = {**{k: str(v) for k, v in (m.get("env") or {}).items()}, **env}
+            if self.engine.needs_hf_token(m) and self.engine.hf_token():
+                env["HF_TOKEN"] = self.engine.hf_token()
+        argv, env = self.engine.run_cmd({"as": who}, step["cmd"], env or None)
         job.say(f"$ {' '.join(step['cmd'])}   (in {step.get('cwd', '.')}, as {self.engine.user if who == 'user' else 'root'})")
         rc = self._stream(job, argv, cwd=step.get("cwd"), env=env, timeout=step.get("timeout", 7200))
         if rc != 0:
