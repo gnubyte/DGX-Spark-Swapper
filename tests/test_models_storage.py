@@ -713,9 +713,11 @@ class StorageSafetyTests(StorageBase):
             (self.home / d).mkdir(parents=True)
             (self.home / d / "kernels.bin").write_bytes(b"k" * 100)
         holders = st.holders()
-        self.assertEqual(holders[f"dir:{self.home}/.cache/vllm"], {"vllmfp4", "hf-x"})
-        self.assertEqual(holders[f"dir:{self.home}/.cache/flashinfer"], {"laguna", "vllmfp4", "hf-x"},
-                         "mounted by two more models although only Laguna declares it")
+        # every catalog model that uses a folder is a holder (Inkling 2 Mini mounts both caches too); only the
+        # installed ones keep a folder from being deleted, which the plans below check
+        self.assertEqual(holders[f"dir:{self.home}/.cache/vllm"], {"vllmfp4", "inkling", "hf-x"})
+        self.assertEqual(holders[f"dir:{self.home}/.cache/flashinfer"], {"laguna", "vllmfp4", "inkling", "hf-x"},
+                         "mounted by three more models although only Laguna declares it")
         plan = st.plan_delete("vllmfp4")
         self.assertIsNotNone(self.part(plan["keep"], f"dir:{self.home}/.cache/vllm"), "the custom model still mounts it")
         self.assertIsNone(self.part(plan["remove"], f"dir:{self.home}/.cache/vllm"))
