@@ -167,19 +167,18 @@ STEP_LABELS = {
     "remove": "Removing it",
     "refresh": "Updating the page, the disk figures and OpenClaw",
     "context": "Saving the new context window",
+    "settings": "Saving the new settings",
     "pictures": "Making room: pictures",
 }
 
-# The Flash Next recipe's two windows, with the recipe settings each needs. 256K is the model's native length, and the
-# smaller KV pool (HOST_RESERVE_GIB 37 instead of the recipe's 26) leaves ~11 GiB more free: room for Qwen-Image next
-# to it. 512K stretches the model with YaRN and needs the recipe's own, bigger pool, so pictures can't run alongside.
-FLASH_CONTEXTS = {
-    262144: {"label": "256K", "detail": "the model's native window — leaves room for pictures", "pictures": True,
-             "env": {"YARN": "0", "MAX_MODEL_LEN": "262144", "HOST_RESERVE_GIB": "37"}},
-    524288: {"label": "512K", "detail": "the longest chats (YaRN) — no room for pictures", "pictures": False,
-             "env": {"YARN": "1", "YARN_MAX_MODEL_LEN": "524288", "HOST_RESERVE_GIB": "26"}},
-}
-CONTEXT_ENV_KEYS = ("YARN", "MAX_MODEL_LEN", "YARN_MAX_MODEL_LEN", "HOST_RESERVE_GIB")
+# What a card lets you change on the page comes from its catalog entry, never from code:
+#   "contexts": [{"tokens", "label", "detail", "pictures", "env", "min_free_gib"?}, …] — the windows it can be served
+#       at, each with the recipe settings that window needs ("pictures": whether Qwen-Image fits beside it). The card's
+#       "context" is the default.
+#   "switches": [{"name", "label", "detail", "default", "on": {env}, "off": {env}, "warn"?, "needs_hf_token"?,
+#       "gated_repo"?, "requires_file"?, "adds_input"?, "experimental"?}, …] — on/off settings, each a set of env values.
+# The choices are kept in the state dir ("contexts" and "switches" in state.json) — the site config isn't touched —
+# and put into a copy of the card whenever the config is loaded (Engine._with_choices).
 
 # Qwen-Image runs in ComfyUI as the box user's qwen-image.service, started on demand by ~/.local/bin/qwen-image, which
 # refuses to start it with less than this much memory available (so it can't push the model under its watchdog's
@@ -199,10 +198,12 @@ class NotInstalled(ValueError):
 class Job:
     def __init__(self, target: str, source: str | None, steps: list[str]):
         self.id = uuid.uuid4().hex[:10]
-        self.kind = "swap"                # swap | context
+        self.kind = "swap"                # swap | context | settings
         self.target = target
         self.source = source
-        self.context: int | None = None   # a context job: the window it changes to
+        self.context: int | None = None   # a context or settings job: the window the model is served at afterwards
+        self.change: str | None = None    # a settings job: what changes, in words ("abliterated on")
+        self.cancel_by: str | None = None # who asked to cancel it: it stops at the next safe point and rolls back
         self.state = "running"          # running | done | failed
         self.error: str | None = None
         self.note: str | None = None
@@ -242,7 +243,7 @@ class Job:
             log = list(self.log)
         return {
             "id": self.id, "kind": self.kind, "target": self.target, "source": self.source, "context": self.context,
-            "state": self.state, "error": self.error, "note": self.note,
+            "change": self.change, "state": self.state, "cancel_requested": bool(self.cancel_by), "error": self.error, "note": self.note,
             "started": self.started, "finished": self.finished,
             "steps": self.steps,
             "log_total": len(log),
@@ -272,8 +273,8 @@ class Engine:
             self.platform_evidence = "demo"
         else:
             self.platform, self.platform_evidence = hardware.detect(sh, site.get("platform"))
-        self.cfg = self._with_contexts(config_mod.merge(site, config_mod.load_json(self.catalog_path, {}) or {},
-                                                        self.platform, self.load_custom()))
+        self.cfg = self._with_choices(config_mod.merge(site, config_mod.load_json(self.catalog_path, {}) or {},
+                                                       self.platform, self.load_custom()))
         self.job: Job | None = None
         self._swap_lock = threading.Lock()
         self._state_lock = threading.Lock()
@@ -282,6 +283,7 @@ class Engine:
         self._mtp_cache: dict[str, bool] = {}
         self.disk_sizes: dict[str, int] = {}   # bytes each installed model takes, filled in by storage.Storage
         self.deleting: str | None = None       # the model being deleted: it can't be switched to meanwhile
+        self.measuring: str | None = None      # the model whose speed is being measured again
         self._demo_removed: set[str] = set()   # demo mode only: models "deleted" in this run
 
     # ── persistent state ──
@@ -330,32 +332,162 @@ class Engine:
     def _merged(self, custom: dict) -> dict:
         """The effective config for `custom` models, from the site config this process started with (so a
         half-edited file, or a changed API key, never takes effect behind a running Swapper's back)."""
-        return self._with_contexts(config_mod.merge(self._site, config_mod.load_json(self.catalog_path, {}) or {},
-                                                    self.platform, custom))
+        return self._with_choices(config_mod.merge(self._site, config_mod.load_json(self.catalog_path, {}) or {},
+                                                   self.platform, custom))
 
-    # ── context windows chosen on the page ──
+    # ── context windows and switches chosen on the page ──
     def context_choices(self) -> dict:
         d = self.load_state().get("contexts")
         return d if isinstance(d, dict) else {}
 
-    def _with_contexts(self, cfg: dict) -> dict:
-        """Each Flash Next card's chosen window (FLASH_CONTEXTS), put into a copy of the card: the recipe settings for
-        that window in its env, and the window as its context."""
+    def switch_choices(self) -> dict:
+        d = self.load_state().get("switches")
+        return d if isinstance(d, dict) else {}
+
+    @staticmethod
+    def contexts_of(m: dict) -> list[dict]:
+        """The windows a card can be served at (its catalog "contexts"), or [] when its window is fixed."""
+        c = m.get("contexts") if m else None
+        return [x for x in c if isinstance(x, dict) and isinstance(x.get("tokens"), int)
+                and not isinstance(x.get("tokens"), bool)] if isinstance(c, list) else []
+
+    @classmethod
+    def context_profile(cls, m: dict, tokens) -> dict | None:
+        return next((c for c in cls.contexts_of(m) if c["tokens"] == tokens), None) if isinstance(tokens, int) else None
+
+    @staticmethod
+    def switches_of(m: dict) -> list[dict]:
+        """The on/off settings a card offers (its catalog "switches")."""
+        s = m.get("switches") if m else None
+        return [x for x in s if isinstance(x, dict) and isinstance(x.get("name"), str) and x["name"]] \
+            if isinstance(s, list) else []
+
+    @staticmethod
+    def variants_of(m: dict) -> dict:
+        """A card's other builds ("variants": name → {"label", "fields"}): a window can name one, and the card then runs
+        from that build's checkout and container (Flash Next's 512K and 1M windows run its long-context build)."""
+        v = m.get("variants") if m else None
+        return {k: x for k, x in v.items() if isinstance(x, dict) and isinstance(x.get("fields"), dict)} \
+            if isinstance(v, dict) else {}
+
+    def _apply_choices(self, m: dict, chosen: int | None, saved: dict | None) -> dict:
+        """A copy of catalog card `m` served at window `chosen` (its default when None or not offered) with switches
+        `saved` (name → on; defaults for the rest): the variant's fields when that window names one, the recipe
+        settings each choice needs in its env, the window as its context, `switches_on` and the inputs it takes."""
+        contexts, switches = self.contexts_of(m), self.switches_of(m)
+        m = copy.deepcopy(m)
+        env = dict(m.get("env") or {})
+        if contexts:
+            profile = self.context_profile(m, chosen) or self.context_profile(m, m.get("context"))
+            if profile:
+                variant = self.variants_of(m).get(profile.get("variant") or "")
+                if variant:
+                    fields = copy.deepcopy(variant["fields"])
+                    env.update({k: str(v) for k, v in (fields.pop("env", None) or {}).items()})
+                    m.update({k: v for k, v in fields.items() if k not in ("contexts", "switches", "variants", "key")})
+                m["variant"] = profile.get("variant") if variant else None
+                drop = {k for c in contexts for k in (c.get("env") or {})}
+                env = {**{k: v for k, v in env.items() if k not in drop}, **(profile.get("env") or {})}
+                m["context"] = profile["tokens"]
+                # OpenClaw is told the window the model really serves, and its name says so ("… 256K ctx)")
+                m["openclaw_context"] = profile["tokens"]
+                if isinstance(m.get("openclaw_model_name"), str):
+                    label = profile.get("label") or self.context_label(profile["tokens"])
+                    m["openclaw_model_name"] = re.sub(r"\b\d+[KM] ctx\b", f"{label} ctx", m["openclaw_model_name"])
+                if isinstance(profile.get("min_free_gib"), (int, float)):
+                    m["min_free_gib"] = profile["min_free_gib"]
+                # a window that serves fewer chats at once than the published "across N" figure drops it
+                perf = m.get("perf")
+                if isinstance(profile.get("streams"), int) and isinstance(perf, dict) \
+                        and isinstance(perf.get("concurrency"), int) and perf["concurrency"] > profile["streams"]:
+                    m["perf"] = {k: v for k, v in perf.items() if k not in ("decode_concurrent", "concurrency")}
+        if switches:
+            saved = saved if isinstance(saved, dict) else {}
+            on = {s["name"]: saved[s["name"]] if isinstance(saved.get(s["name"]), bool) else bool(s.get("default"))
+                  for s in switches}
+            for s in switches:
+                env.update({k: str(v) for k, v in (s.get("on" if on[s["name"]] else "off") or {}).items()})
+            m["switches_on"] = on
+            if isinstance(m.get("openclaw_model_name"), str):
+                m["openclaw_model_name"] += "".join(s["name_suffix"] for s in switches
+                                                    if on[s["name"]] and isinstance(s.get("name_suffix"), str))
+            inputs = list(m.get("inputs") or [])
+            inputs += [s["adds_input"] for s in switches if on[s["name"]] and s.get("adds_input")
+                       and s["adds_input"] not in inputs]
+            if inputs:
+                m["inputs"] = inputs
+        m["env"] = env
+        return m
+
+    def _with_choices(self, cfg: dict) -> dict:
+        """Put each card's chosen window and switches into it (_apply_choices). Where nothing was chosen, the card's
+        defaults apply."""
         models = cfg.get("models") or {}
-        for key, tokens in self.context_choices().items():
-            m = models.get(key)
-            profile = FLASH_CONTEXTS.get(tokens) if isinstance(tokens, int) else None
-            if not m or m.get("kind") != "flash-vllm" or not profile:
-                continue
-            m = models[key] = copy.deepcopy(m)
-            m["env"] = {**{k: v for k, v in (m.get("env") or {}).items() if k not in CONTEXT_ENV_KEYS},
-                        **profile["env"]}
-            m["context"] = tokens
+        ctx_choice, sw_choice = self.context_choices(), self.switch_choices()
+        for key, m in list(models.items()):
+            if self.contexts_of(m) or self.switches_of(m):
+                models[key] = self._apply_choices(m, ctx_choice.get(key), sw_choice.get(key))
         return cfg
 
-    def _choose_context(self, key: str, tokens: int):
-        self.update_state("contexts", lambda d: {**(d if isinstance(d, dict) else {}), key: tokens})
+    def _base_model(self, key: str) -> dict | None:
+        """Card `key` as the catalog and site config give it, before any choice made on the page."""
+        return config_mod.merge(self._site, config_mod.load_json(self.catalog_path, {}) or {}, self.platform,
+                                self.load_custom())["models"].get(key)
+
+    def preview(self, key: str, tokens: int | None, switches: dict | None) -> dict | None:
+        """Card `key` as it would be with window `tokens` and switches `switches` (nothing is saved)."""
+        base = self._base_model(key)
+        return self._apply_choices(base, tokens, switches) if base else None
+
+    def variant_model(self, key: str, variant: str) -> dict | None:
+        """Card `key` as its `variant` build: served at the first window that uses that build."""
+        m = self.models.get(key)
+        tokens = next((c["tokens"] for c in self.contexts_of(m) if c.get("variant") == variant), None) if m else None
+        if tokens is None:
+            return None
+        return self.preview(key, tokens, m.get("switches_on"))
+
+    def variant_installed(self, key: str, variant: str) -> bool:
+        if DEMO:
+            return False
+        vm = self.variant_model(key, variant)
+        ready = ((vm or {}).get("install") or {}).get("ready") or []
+        return bool(vm and ready and all(self._ready(vm, c)[0] for c in ready))
+
+    def _choose(self, key: str, tokens: int | None = None, switches: dict | None = None):
+        if tokens is not None:
+            self.update_state("contexts", lambda d: {**(d if isinstance(d, dict) else {}), key: tokens})
+        if switches is not None:
+            self.update_state("switches", lambda d: {**(d if isinstance(d, dict) else {}), key: dict(switches)})
         self.reload_models()
+
+    def needs_hf_token(self, m: dict) -> bool:
+        """A switch that is on downloads something gated (the abliteration overlay, say)."""
+        on = m.get("switches_on") or {}
+        return any(on.get(s["name"]) and s.get("needs_hf_token") for s in self.switches_of(m))
+
+    def _switch_unsupported(self, m: dict, s: dict) -> str | None:
+        """Why the recipe checkout card `m` runs from can't do switch `s` (a file the switch needs is missing)."""
+        if not s.get("requires_file") or DEMO or not m.get("dir") or (Path(m["dir"]) / s["requires_file"]).exists():
+            return None
+        if m.get("variant"):
+            label = next((c.get("label") for c in self.contexts_of(m) if c["tokens"] == m.get("context")), "")
+            return (f"{s.get('label', s['name'])} isn't available at {label or 'this window'}: "
+                    f"{self.variants_of(m)[m['variant']].get('label', 'that build')} doesn't have it.")
+        return (f"{s.get('label', s['name'])} needs a newer {m['title']} recipe than the one on this box. "
+                "Press Update recipe… in the card's Details first.")
+
+    def switch_blocker(self, m: dict, s: dict) -> str | None:
+        """Why switch `s` of card `m` can't be turned on yet, or None."""
+        unsupported = self._switch_unsupported(m, s)
+        if unsupported:
+            return unsupported
+        if s.get("needs_hf_token") and not self.hf_token() and not DEMO:
+            gate = f" after accepting its terms at https://huggingface.co/{s['gated_repo']} (signed in)" \
+                if s.get("gated_repo") else ""
+            return (f"{s.get('label', s['name'])} downloads a gated file from Hugging Face, so it needs a token: save "
+                    f"one on the Settings tab ▸ Hugging Face{gate}.")
+        return None
 
     # ── what changed, for the page (a small rotating file next to the state) ──
     @property
@@ -710,6 +842,8 @@ class Engine:
             "install_detail": inst["detail"],
             "install": {"size_gb": install.get("size_gb"), "time": install.get("time"),
                         "requires": install.get("requires", []), "note": install.get("note")} if install else None,
+            # a recipe kept as a git checkout: installing again pulls the newest version and prepares it
+            "updatable": any(s.get("do") == "git" for s in install.get("steps", [])),
             "perf": m.get("perf"),
             "measured": measured.get(key),
             "recommended": bool(m.get("recommended")),
@@ -722,10 +856,43 @@ class Engine:
             "hf_repos": self.model_hf_repos(m),
             "disk_bytes": self.disk_sizes.get(key),
             "notes": m.get("notes") or [],
-            # the windows the page can switch it between (Flash Next's recipe only)
-            "contexts": [{"tokens": t, "label": p["label"], "detail": p["detail"], "pictures": p["pictures"]}
-                         for t, p in FLASH_CONTEXTS.items()] if m["kind"] == "flash-vllm" else None,
+            # what the page can change: the windows it can be served at, and its on/off settings
+            "contexts": [self._context_summary(key, m, c, inst["installed"]) for c in self.contexts_of(m)] or None,
+            "variant": m.get("variant"),
+            "switches": [self._switch_summary(m, s) for s in self.switches_of(m)] or None,
+            # what it takes as input besides text ("images", "video", "PDFs"); None: images and video if "vision"
+            "inputs": list(m["inputs"]) if isinstance(m.get("inputs"), list) else None,
         }
+
+    def _context_summary(self, key: str, m: dict, c: dict, installed: bool) -> dict:
+        """One window of a card for the page; a window that runs another build says which, and whether it's installed."""
+        out = {"tokens": c["tokens"], "label": c.get("label") or self.context_label(c["tokens"]),
+               "detail": c.get("detail", ""), "pictures": bool(c.get("pictures")), "variant": c.get("variant")}
+        v = c.get("variant")
+        if v and v in self.variants_of(m):
+            info = self.variants_of(m)[v]
+            out["variant_label"] = info.get("label", v)
+            out["installed"] = installed if m.get("variant") == v else self.variant_installed(key, v)
+            out["install"] = {"size_gb": info.get("size_gb"), "time": info.get("time")}
+        else:
+            out["installed"] = installed if not m.get("variant") else self._default_build_installed(key)
+        return out
+
+    def _default_build_installed(self, key: str) -> bool:
+        """Whether the card's own build (not a variant) is installed, while a variant's window is chosen."""
+        base = self._base_model(key)
+        ready = ((base or {}).get("install") or {}).get("ready") or []
+        return bool(base and all(self._ready(base, c)[0] for c in ready))
+
+    def _switch_summary(self, m: dict, s: dict) -> dict:
+        on = bool((m.get("switches_on") or {}).get(s["name"], s.get("default")))
+        blocker = None if on else self.switch_blocker(m, s)
+        return {"name": s["name"], "label": s.get("label", s["name"]), "off_label": s.get("off_label"),
+                "detail": s.get("detail", ""), "admin_only": bool(s.get("admin_only")),
+                "on": on, "default": bool(s.get("default")), "warn": s.get("warn"),
+                "experimental": bool(s.get("experimental")), "needs_hf_token": bool(s.get("needs_hf_token")),
+                "adds_input": s.get("adds_input"),
+                "gated_repo": s.get("gated_repo"), "available": blocker is None, "why": blocker}
 
     @staticmethod
     def model_hf_repos(m: dict) -> list[str]:
@@ -786,6 +953,7 @@ class Engine:
             "openclaw_in_use": True if DEMO else self.openclaw_in_use(),
             "vision": self.vision_state(),
             "busy": bool(self.job and self.job.state == "running"),
+            "measuring": self.measuring,
             "version": self.version,
             "platform": self.platform,
             "platform_label": hardware.label(self.platform),
@@ -1032,6 +1200,7 @@ class Engine:
         # The Flash launcher refuses to start while any process holds the GPU;
         # give a stopped server's workers time to exit first.
         for i in range(60):
+            self.check_cancel(job)
             tenants = self.gpu_tenants()
             if not tenants:
                 if i:
@@ -1046,6 +1215,7 @@ class Engine:
         deadline = time.time() + 180
         last = -1.0
         while True:
+            self.check_cancel(job)
             mem = meminfo()
             if mem["available"] >= need:
                 job.say(f"Memory available: {mem['available']:.0f} GiB of {mem['total']:.0f} GiB. Good to go.")
@@ -1171,6 +1341,10 @@ class Engine:
             self._wait_healthy(key, job, timeout + 120, proc=proc, logfile=logfile)
         elif kind == "recipe-script":
             env = {"PORT": self.api_port, **(m.get("env") or {})}
+            if self.needs_hf_token(m) and self.hf_token():
+                # a switch that is on downloads a gated file on its first start (the abliteration overlay); the
+                # token goes to the recipe's own Hugging Face download, and the log line hides it
+                env["HF_TOKEN"] = self.hf_token()
             argv, penv = self.run_cmd(m, m.get("start") or ["bash", "./start.sh"], env)
             logfile = self.state_dir / f"start-{key}-{job.id}.log"
             job.say(f"{' '.join(m.get('start') or ['./start.sh'])} in {m['dir']}  ({shown_env(env)})")
@@ -1233,6 +1407,10 @@ class Engine:
         last_beat = t0
         seen_running = False
         while True:
+            if job.cancel_by and job.state == "running":
+                if proc is not None and proc.poll() is None:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                self.check_cancel(job)
             # stream the launcher's output (recipe scripts)
             if logfile and logfile.exists():
                 with open(logfile, errors="replace") as fh:
@@ -1296,8 +1474,12 @@ class Engine:
 
     @staticmethod
     def _chat_extras(m: dict) -> dict:
-        """Ask for a plain, non-thinking reply in the speed check — unless the engine refuses the field."""
-        return {"chat_template_kwargs": {"enable_thinking": False}} if m.get("template_kwargs", True) else {}
+        """Ask for a plain, non-thinking reply in the speed check — unless the engine refuses the field.
+        A model whose template switches thinking off another way names its own kwargs (a dict)."""
+        tk = m.get("template_kwargs", True)
+        if isinstance(tk, dict):
+            return {"chat_template_kwargs": dict(tk)} if tk else {}
+        return {"chat_template_kwargs": {"enable_thinking": False}} if tk else {}
 
     def measure(self, key: str, job: Job | None = None, usage: bool = True) -> dict | None:
         """Stream one ~256-token reply and time it: decode tokens per second after
@@ -1393,12 +1575,73 @@ class Engine:
         if result.get("decode"):
             job.say(f"Speed here: {result['decode']} tokens/s decode, first token after {result['ttft']} s "
                     f"({result['tokens']} tokens, thinking off).")
+            self._save_measured(key, result)
 
-            def put(cur):
-                cur = dict(cur or {})
-                cur[key] = {"decode": result["decode"], "ttft": result["ttft"], "at": time.time()}
-                return cur
-            self.update_state("measured", put)
+    def _save_measured(self, key: str, result: dict):
+        def put(cur):
+            cur = dict(cur or {})
+            cur[key] = {"decode": result["decode"], "ttft": result.get("ttft"), "at": time.time()}
+            return cur
+        self.update_state("measured", put)
+
+    # ── measure again: the speed check on the model that is serving, without a switch ──
+    def begin_measure(self, by: str = "the page") -> str:
+        """Time one reply from the serving model again, in the background (the card's "Measure speed"). Returns the
+        model's key; `status()["measuring"]` names it until the result is saved."""
+        if self.updating():
+            raise RuntimeError("Spark Swapper is updating itself — try again in a minute.")
+        if self.job and self.job.state == "running":
+            raise RuntimeError("A switch is in progress — measure when it has finished.")
+        key = self.status(fresh=True).get("active")
+        if not key:
+            raise ValueError("No model is serving.")
+        with self._state_lock:
+            if self.measuring:
+                raise RuntimeError("Already measuring.")
+            self.measuring = key
+        title = self.models[key]["title"]
+
+        def run():
+            try:
+                if DEMO:
+                    time.sleep(2)
+                    base = (self.models[key].get("perf") or {}).get("decode") or 40.0
+                    result = {"decode": round(base * 0.97, 1), "ttft": 0.2, "tokens": 256}
+                else:
+                    result = self.measure(key) or self.measure(key, usage=False)
+                if result and result.get("decode"):
+                    self._save_measured(key, result)
+                    self.activity(f"{title} measured again ({by}): {result['decode']} tok/s")
+                else:
+                    self.activity(f"Measuring {title} again ({by}) failed: it didn't stream a reply")
+            except Exception as e:  # noqa: BLE001 — a background check must not take the service down
+                self.activity(f"Measuring {title} again failed: {e}")
+            finally:
+                self.measuring = None
+                self._status_cache = None
+        threading.Thread(target=run, daemon=True).start()
+        self._status_cache = None
+        return key
+
+    # ── cancelling a switch ──
+    def cancel_job(self, by: str) -> Job:
+        """Ask the running switch or restart to stop. It stops at its next safe point (while it waits for memory or
+        for the model to answer) and goes back to what was serving, the way a failed switch does."""
+        job = self.job
+        if not job or job.state != "running":
+            raise ValueError("Nothing is switching right now.")
+        if not job.cancel_by:
+            job.cancel_by = by
+            job.say(f"Cancel asked for by {by}: stopping at the next safe point and bringing back what was serving…")
+            self.activity(f"{by} cancelled {'the switch to' if job.kind == 'swap' else 'the restart of'} "
+                          f"{self.models.get(job.target, {}).get('title', job.target)}")
+        return job
+
+    @staticmethod
+    def check_cancel(job: Job | None):
+        # only while the job runs: the rollback that follows a cancel (the job is "failed" by then) must not stop too
+        if job is not None and job.cancel_by and job.state == "running":
+            raise SwapFailed(f"Cancelled by {job.cancel_by}.")
 
     # ── the swap ──
     def begin_swap(self, target: str) -> Job:
@@ -1450,13 +1693,16 @@ class Engine:
                     job.say("Target is half-loaded; restarting it cleanly.")
                     self.stop_model(target, job)
                 cur = "memory"; job.step(cur, "running")
+                self.check_cancel(job)
                 self.wait_memory(target, job)
                 job.step(cur, "done")
                 cur = "start"; job.step(cur, "running")
+                self.check_cancel(job)
                 self.start_model(target, job)
                 job.step(cur, "done")
 
             cur = "verify"; job.step(cur, "running")
+            self.check_cancel(job)
             self.verify(target, job)
             job.step(cur, "done")
 
@@ -1498,6 +1744,13 @@ class Engine:
             self.activity(f"Switching to {self.models[target]['title']} failed: {msg}")
             if source and source != target and cur in ("start", "verify", "memory"):
                 self._rollback(job, source)
+            elif job.cancel_by and cur in ("start", "verify"):
+                # nothing to go back to: don't leave a half-loaded model holding the memory
+                try:
+                    if self.model_running(target, self.running_containers(), self.active_units()):
+                        self.stop_model(target, job)
+                except Exception as e2:  # noqa: BLE001
+                    job.say(f"Couldn't stop it: {e2}")
         finally:
             job.finished = time.time()
             self._status_cache = None
@@ -1520,91 +1773,165 @@ class Engine:
             job.step("rollback", "failed", str(e))
             job.say(f"✗ Rollback failed too: {e}")
 
-    # ── the context window: 256K (room for pictures) or 512K ──
+    # ── a card's window and switches: saved for its next start, or a restart when it is serving ──
     @staticmethod
     def context_label(tokens: int | None) -> str:
-        p = FLASH_CONTEXTS.get(tokens) if isinstance(tokens, int) else None
-        return p["label"] if p else (f"{tokens // 1024}K" if tokens else "?")
+        if not isinstance(tokens, int) or not tokens:
+            return "?"
+        return f"{tokens // 1048576}M" if tokens % 1048576 == 0 else f"{tokens // 1024}K"
+
+    def describe_settings(self, m: dict, tokens: int | None, switches: dict | None, old_tokens: int | None = None,
+                          old_switches: dict | None = None) -> str:
+        """What a change does, in words: "256K → 128K, abliterated on"."""
+        parts = []
+        if tokens is not None and old_tokens is not None and tokens != old_tokens:
+            parts.append(f"{self.context_label(old_tokens)} → {self.context_label(tokens)}")
+        labels = {s["name"]: s.get("label", s["name"]) for s in self.switches_of(m)}
+        for name, on in (switches or {}).items():
+            if old_switches is None or bool(old_switches.get(name)) != bool(on):
+                label = labels.get(name, name)
+                label = label if re.match(r"[A-Z]{2}", label) else label[:1].lower() + label[1:]
+                parts.append(f"{label} {'on' if on else 'off'}")
+        return ", ".join(parts) or "no change"
 
     def begin_context(self, key: str, tokens: int) -> Job | None:
-        """Serve Flash Next card `key` with `tokens` of context. The choice is saved; when that model is the one
-        serving, it restarts with it — a job like a switch (steps, a log, the old window back if the new one won't
-        start). None when there's nothing to restart: the model isn't serving (the choice applies the next time it's
-        switched to) or already serves that window."""
+        """Serve card `key` at `tokens` of context (one of its catalog "contexts"). See begin_settings."""
+        return self.begin_settings(key, context=tokens)
+
+    def begin_settings(self, key: str, context: int | None = None, switches: dict | None = None) -> Job | None:
+        """Change card `key`'s window and/or switches. The choice is saved; when that model is the one serving, it
+        restarts with it — a job like a switch (steps, a log, and the old settings back if the new ones won't start).
+        None when there's nothing to restart: the model isn't serving (the choice applies the next time it's switched
+        to) or already serves those settings."""
         m = self.models.get(key)
         if not m:
             raise ValueError("Unknown model.")
-        if m.get("kind") != "flash-vllm" or tokens not in FLASH_CONTEXTS:
-            raise ValueError(f"{m['title']} can be served at {' or '.join(p['label'] for p in FLASH_CONTEXTS.values())} "
-                             "only (the Flash Next recipe's windows)." if m.get("kind") == "flash-vllm"
-                             else f"{m['title']}'s context can't be changed here.")
+        contexts, offered = self.contexts_of(m), {s["name"]: s for s in self.switches_of(m)}
+        if context is not None:
+            if not contexts:
+                raise ValueError(f"{m['title']}'s context can't be changed here.")
+            if not self.context_profile(m, context):
+                labels = " or ".join(c.get("label") or self.context_label(c["tokens"]) for c in contexts)
+                raise ValueError(f"{m['title']} can be served at {labels} only.")
+        switches = dict(switches or {})
+        for name, on in switches.items():
+            if name not in offered:
+                raise ValueError(f"{m['title']} has no setting called {name!r}." if offered
+                                 else f"{m['title']} has no settings to change here.")
+            if not isinstance(on, bool):
+                raise ValueError(f"Say true or false for {name}.")
+        if context is None and not switches:
+            raise ValueError("Nothing to change.")
+        old_sw = dict(m.get("switches_on") or {})
+        changed = {n: v for n, v in switches.items() if bool(old_sw.get(n)) != v}
+        # the card as it would be: another window can mean another build (a variant) with other abilities
+        target = self.preview(key, context, {**old_sw, **switches}) if context is not None and \
+            context != m.get("context") else m
+        target = target or m
+        for name, on in changed.items():
+            why = self.switch_blocker(target, offered[name]) if on else None
+            if why:
+                raise ValueError(why)
+        if target is not m:
+            for name, on in {**old_sw, **switches}.items():
+                why = self._switch_unsupported(target, offered[name]) if on and name in offered else None
+                if why:
+                    raise ValueError(f"{why} Turn it off first, or keep the window as it is.")
+            variant = target.get("variant")
+            if variant and variant != m.get("variant") and not self.variant_installed(key, variant):
+                label = self.variants_of(target)[variant].get("label", "another build")
+                raise ValueError(f"{self.context_label(context)} runs {label}, which isn't installed yet. Install it "
+                                 "from Options… on the card first (the model that is serving keeps serving).")
+            if not variant and m.get("variant") and not DEMO and not self._default_build_installed(key):
+                raise ValueError(f"{self.context_label(context)} runs {m['title']}'s own build, which isn't installed "
+                                 "any more. Install it again from the card first.")
         if self.updating():
             raise RuntimeError("Spark Swapper is updating itself — try again in a minute.")
         if self.job and self.job.state == "running":
             raise RuntimeError("A switch is already in progress.")
         st = self.status(fresh=True)
         old = int(m["context"])
+        new = context if context is not None else old
+        new_sw = {**old_sw, **switches} if offered else None
+        what = self.describe_settings(m, new, changed, old, old_sw)
         if key not in (st["active"], st["loading"]):
-            if old != tokens:
-                self._choose_context(key, tokens)
-                self.activity(f"{m['title']}: context set to {self.context_label(tokens)} — it applies the next "
-                              "time it's switched to")
+            if old != new or changed:
+                self._choose(key, new if contexts else None, new_sw)
+                said = what if changed else f"context set to {self.context_label(new)}"
+                self.activity(f"{m['title']}: {said} — it applies the next time it's switched to")
             return None
         served = (st["models"].get(key) or {}).get("served_context")
-        if old == tokens and served == tokens:
+        if old == new and served in (None, new) and not changed:
             return None
         if not self._swap_lock.acquire(blocking=False):
             raise RuntimeError("A switch is already in progress.")
         try:
-            job = Job(key, key, ["context", "pictures", "stop", "memory", "start", "verify"])
-            job.kind, job.context = "context", tokens
+            kind = "settings" if changed else "context"
+            job = Job(key, key, [kind, "pictures", "stop", "memory", "start", "verify"])
+            job.kind, job.context, job.change = kind, new, what
             self.job = job
-            threading.Thread(target=self._run_context, args=(job, served or old), daemon=True).start()
+            threading.Thread(target=self._run_settings,
+                             args=(job, served or old, old_sw if offered else None, new_sw), daemon=True).start()
             return job
         except Exception:
             self._swap_lock.release()
             raise
 
-    def _run_context(self, job: Job, old: int):
+    def _run_settings(self, job: Job, old: int, old_sw: dict | None, new_sw: dict | None):
         key, tokens = job.target, job.context
-        title = self.models[key]["title"]
-        new, was = self.context_label(tokens), self.context_label(old)
+        m0 = self.models[key]
+        title, has_contexts = m0["title"], bool(self.contexts_of(m0))
+        new, what = self.context_label(tokens), job.change or ""
+        settings = job.kind == "settings"
+        profile = self.context_profile(m0, tokens)
         cur = None
         try:
-            cur = "context"; job.step(cur, "running")
-            self._choose_context(key, tokens)
-            job.say(f"{title}: {was} → {new} ({shown_env(FLASH_CONTEXTS[tokens]['env'])})")
-            self.activity(f"{title}: changing the context {was} → {new}")
+            cur = job.steps[0]["key"]; job.step(cur, "running")
+            job.say(f"{title}: {what}")
+            self.activity(f"{title}: changing {what}")
             job.step(cur, "done")
 
             cur = "pictures"; job.step(cur, "running")
-            if not FLASH_CONTEXTS[tokens]["pictures"] and self.pictures_enabled():
+            if profile and not profile.get("pictures") and self.pictures_installed() and self.pictures_enabled():
                 self.set_pictures(False, by=f"the switch to {new}", job=job)
                 job.step(cur, "done", f"pictures turned off — there's no room for them next to {new}")
             else:
                 job.step(cur, "skipped")
 
+            # stopped with the settings it was started with (another window can mean another build and container),
+            # and only then the new ones are saved
             cur = "stop"; job.step(cur, "running")
             self.stop_model(key, job)
+            self._choose(key, tokens if has_contexts else None, new_sw)
+            m = self.models[key]
+            touched = set((profile or {}).get("env") or {})
+            for s in self.switches_of(m):
+                touched |= set(s.get("on") or {}) | set(s.get("off") or {})
+            job.say(f"New settings: {shown_env({k: v for k, v in (m.get('env') or {}).items() if k in touched})}"
+                    + (f" — runs from {m['dir']}" if m.get("variant") and m.get("dir") else ""))
             job.step(cur, "done")
             cur = "memory"; job.step(cur, "running")
+            self.check_cancel(job)
             self.wait_memory(key, job)
             job.step(cur, "done")
             cur = "start"; job.step(cur, "running")
+            self.check_cancel(job)
             self.start_model(key, job)
             job.step(cur, "done")
             cur = "verify"; job.step(cur, "running")
+            self.check_cancel(job)
             self.verify(key, job)
             served = (self.served() or {}).get("context")
-            if served and served != tokens:
+            if has_contexts and served and served != tokens:
                 raise SwapFailed(f"The model came back serving {self.context_label(served)}, not {new}.")
-            job.say(f"Serving {new} ✓")
+            job.say(f"Serving with {what} ✓" if settings else f"Serving {new} ✓")
             job.step(cur, "done")
 
-            self.save_state(last_context={"model": key, "to": tokens, "from": old, "at": time.time(), "ok": True})
-            self.activity(f"{title} serves {new} now")
+            self.save_state(last_context={"model": key, "to": tokens, "from": old, "change": what,
+                                          "at": time.time(), "ok": True})
+            self.activity(f"{title} serves with {what} now" if settings else f"{title} serves {new} now")
             job.state = "done"
-            if FLASH_CONTEXTS[tokens]["pictures"] and not self.pictures_enabled() and self.pictures_installed():
+            if profile and profile.get("pictures") and self.pictures_installed() and not self.pictures_enabled():
                 job.note = "There's room for pictures now — turn them on below."
         except Exception as e:  # noqa: BLE001 — every failure must reach the UI
             msg = str(e) if isinstance(e, SwapFailed) else f"{type(e).__name__}: {e}"
@@ -1613,33 +1940,38 @@ class Engine:
                 job.step(cur, "failed", msg)
             job.error = msg
             job.state = "failed"
-            self.save_state(last_context={"model": key, "to": tokens, "from": old, "at": time.time(), "ok": False,
-                                          "error": msg})
-            self.activity(f"{title}: changing the context to {new} failed: {msg}")
+            self.save_state(last_context={"model": key, "to": tokens, "from": old, "change": what,
+                                          "at": time.time(), "ok": False, "error": msg})
+            self.activity(f"{title}: changing {what} failed: {msg}")
             if cur in ("memory", "start", "verify"):
-                self._context_rollback(job, key, old)
+                self._settings_rollback(job, key, old if has_contexts else None, old_sw)
         finally:
             job.finished = time.time()
             self._status_cache = None
             self._swap_lock.release()
 
-    def _context_rollback(self, job: Job, key: str, old: int):
-        title, was = self.models[key]["title"], self.context_label(old)
+    def _settings_rollback(self, job: Job, key: str, old: int | None, old_sw: dict | None):
+        title = self.models[key]["title"]
+        settings = job.kind == "settings" or old is None
+        was = "its previous settings" if settings else self.context_label(old)
         job.step("rollback", "running")
-        job.say(f"Bringing {title} back at {was} so you are not left without a model…")
+        job.say(f"Bringing {title} back {'with' if settings else 'at'} {was} so you are not left without a model…")
         try:
-            self._choose_context(key, old)
+            new_container = self.models[key].get("container")
             if self.model_running(key, self.running_containers(), self.active_units()):
+                self.stop_model(key, job)          # whatever the new settings started
+            self._choose(key, old, old_sw)
+            if self.models[key].get("container") != new_container and                     self.model_running(key, self.running_containers(), self.active_units()):
                 self.stop_model(key, job)
             self.wait_memory(key, job)
             self.start_model(key, job)
             job.step("rollback", "done")
-            job.note = f"{title} is serving again at {was}."
-            self.activity(f"{title} is back at {was}")
+            job.note = f"{title} is serving again {'with' if settings else 'at'} {was}."
+            self.activity(f"{title} is back {'with' if settings else 'at'} {was}")
         except Exception as e:  # noqa: BLE001
             job.step("rollback", "failed", str(e))
             job.say(f"✗ Bringing it back failed too: {e}")
-            self.activity(f"{title}: bringing it back at {was} failed too: {e}")
+            self.activity(f"{title}: bringing it back failed too: {e}")
 
     # ── pictures: Qwen-Image in ComfyUI (the box user's qwen-image.service, started on demand by qwen-image) ──
     def _pictures_paths(self) -> dict:
@@ -1683,6 +2015,19 @@ class Engine:
             return False
         return self._user_systemctl("is-active", PICTURES_UNIT, timeout=10)[1].strip() == "active"
 
+    def _picture_room(self, st: dict) -> tuple[dict | None, int | None, bool | None, str | None]:
+        """(serving card, its window, whether Qwen-Image fits beside that window, the label of a window that leaves
+        room). The room is None when the card's window isn't one of its catalog contexts (nothing to say then)."""
+        active = st.get("active")
+        m = self.models.get(active) if active else None
+        if not m:
+            return None, None, None, None
+        served = (st["models"].get(active) or {}).get("served_context") or m.get("context")
+        profile = self.context_profile(m, served)
+        roomy = next((c.get("label") or self.context_label(c["tokens"]) for c in self.contexts_of(m)
+                      if c.get("pictures")), None)
+        return m, served, (bool(profile.get("pictures")) if profile else None), roomy
+
     def pictures_status(self, log: bool = False) -> dict:
         """Whether pictures can be made now, and every check that says so."""
         installed = self.pictures_installed()
@@ -1690,10 +2035,7 @@ class Engine:
         running = installed and self.pictures_running()
         st = self.status()
         active = st.get("active")
-        m = self.models.get(active) if active else None
-        served = (st["models"].get(active) or {}).get("served_context") if active else None
-        room = FLASH_CONTEXTS[served]["pictures"] if m and m.get("kind") == "flash-vllm" and served in FLASH_CONTEXTS \
-            else None
+        m, served, room, roomy = self._picture_room(st)
         available = float((st.get("memory") or {}).get("available") or 0)
         try:
             last_used = self._pictures_paths()["stamp"].stat().st_mtime if not DEMO else None
@@ -1710,7 +2052,7 @@ class Engine:
             checks.append({"key": "context", "ok": room,
                            "text": f"{m['title']} serves {self.context_label(served)} — there's room" if room else
                                    f"{m['title']} serves {self.context_label(served)}: no room for pictures next to "
-                                   "it (switch to 256K)"})
+                                   f"it{f' (switch to {roomy})' if roomy else ''}"})
         elif not active:
             checks.append({"key": "context", "ok": False, "text": "No model is serving"})
         if running:
@@ -1740,13 +2082,10 @@ class Engine:
         if enabled and not self.pictures_installed():
             raise ValueError("Pictures aren't installed on this box (~/.local/bin/qwen-image).")
         if enabled:
-            st = self.status(fresh=True)
-            active = st.get("active")
-            m = self.models.get(active) if active else None
-            served = (st["models"].get(active) or {}).get("served_context") if active else None
-            if m and m.get("kind") == "flash-vllm" and served in FLASH_CONTEXTS and not FLASH_CONTEXTS[served]["pictures"]:
+            m, served, room, roomy = self._picture_room(self.status(fresh=True))
+            if room is False:
                 raise RuntimeError(f"{m['title']} serves {self.context_label(served)}, which leaves no room for "
-                                   "pictures. Switch it to 256K first.")
+                                   f"pictures.{f' Switch it to {roomy} first.' if roomy else ''}")
         say = job.say if job else (lambda _m: None)
         flag = {"enabled": bool(enabled), "by": by, "at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
         if DEMO:
@@ -1828,6 +2167,17 @@ class Engine:
             "context": active.get("served_context") or active.get("context"),
             "fingerprint": cert_fingerprint(cert_path) or (":".join(["00"] * 32) if DEMO else None),
             "anthropic_api": bool(active.get("anthropic_api")),
+            "title": active.get("title"),
+            # what the serving model takes besides text, for the image example on the Connect tab
+            "inputs": active.get("inputs") or (["images", "video"] if active.get("vision") else []),
+            # the models that speak the Anthropic Messages API (installed ones first), for the Claude Code guide
+            "anthropic_models": [m["title"] for m in sorted(st["models"].values(), key=lambda x: x.get("order", 9))
+                                 if m.get("anthropic_api") and m.get("installed")]
+                                or [m["title"] for m in sorted(st["models"].values(), key=lambda x: x.get("order", 9))
+                                    if m.get("anthropic_api")],
+            # the installed models that read images, for "switch to one of these" when the serving one doesn't
+            "vision_models": [m["title"] for m in sorted(st["models"].values(), key=lambda x: x.get("order", 9))
+                              if m.get("vision") and m.get("installed")],
         }
 
     def credentials(self, request_host: str | None = None) -> dict:

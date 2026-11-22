@@ -688,13 +688,16 @@ class InstallStepTests(TempDir):
         import engine as engine_mod
         self.assertEqual(engine_mod.DOCKER_KINDS, ("docker", "sglang-docker"))
         eng, _ = self.make()
-        for key in ("laguna", "ornith", "vllmfp4", "standard"):
+        for key in ("laguna", "inkling", "ornith", "vllmfp4", "standard"):
             self.assertIn(eng.models[key]["kind"], engine_mod.DOCKER_KINDS)
             self.assertTrue(eng.own_key(eng.models[key]), f"{key}'s server checks the API key itself")
             args = eng.models[key]["docker_run"]
             self.assertEqual(args.count("--api-key") + sum(a.startswith("TABBY_API_KEY=") for a in args), 1, key)
         self.assertEqual(Engine._chat_extras(eng.models["ornith"]), {})
         self.assertEqual(Engine._chat_extras(eng.models["laguna"]), {"chat_template_kwargs": {"enable_thinking": False}})
+        # Inkling's template switches thinking off with reasoning_effort, not enable_thinking.
+        self.assertEqual(Engine._chat_extras(eng.models["inkling"]),
+                         {"chat_template_kwargs": {"reasoning_effort": "none"}})
 
 
 # ─────────────────────────────── review findings: things that must stay fixed ───────────────────────────────
@@ -710,9 +713,11 @@ class StorageSafetyTests(StorageBase):
             (self.home / d).mkdir(parents=True)
             (self.home / d / "kernels.bin").write_bytes(b"k" * 100)
         holders = st.holders()
-        self.assertEqual(holders[f"dir:{self.home}/.cache/vllm"], {"vllmfp4", "hf-x"})
-        self.assertEqual(holders[f"dir:{self.home}/.cache/flashinfer"], {"laguna", "vllmfp4", "hf-x"},
-                         "mounted by two more models although only Laguna declares it")
+        # every catalog model that uses a folder is a holder (Inkling 2 Mini mounts both caches too); only the
+        # installed ones keep a folder from being deleted, which the plans below check
+        self.assertEqual(holders[f"dir:{self.home}/.cache/vllm"], {"vllmfp4", "inkling", "hf-x"})
+        self.assertEqual(holders[f"dir:{self.home}/.cache/flashinfer"], {"laguna", "vllmfp4", "inkling", "hf-x"},
+                         "mounted by three more models although only Laguna declares it")
         plan = st.plan_delete("vllmfp4")
         self.assertIsNotNone(self.part(plan["keep"], f"dir:{self.home}/.cache/vllm"), "the custom model still mounts it")
         self.assertIsNone(self.part(plan["remove"], f"dir:{self.home}/.cache/vllm"))

@@ -86,21 +86,24 @@ measures every model on your box when it loads it, and shows that next to these.
 | Model | Recipe | Context | Speed |
 |---|---|---:|---|
 | **Qwen3.8 27B** (TensorFold, DFlash2) | [MiaAI-Lab/Qwen3.8-27B-DGX-Spark-TensorFold](https://github.com/MiaAI-Lab/Qwen3.8-27B-DGX-Spark-TensorFold) | 262,144 | 58.3 prose · 136.9 code · 220.6 across 8 |
-| **Qwen3.8 Flash Next** (TensorFold Zig engine, NVIDIA FP4, MTP) | [MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold) | 262,144 | 49.8 prose · 50.9 code · 198.2 across 5 (prefill ≈2,400/s) |
+| **Qwen3.8 Flash Next** (TensorFold v1.2.7 Zig engine, NVIDIA FP4, MTP) — images; video, PDFs and abliterated optional | [MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold) | 262,144 or 131,072; 524,288 or 1,048,576 on its long-context build | 58.5 prose · 51.9 code · 230.1 across 5 (prefill ≈2,300/s); long-context build 64.4 · 200.9 across 8 at 262K |
 | **Nemotron 3.5 Bolt** 74B-A9B (TensorFold Zig engine, IQ2_XXS + NVFP4, LiLiCorr drafts) | [MiaAI-Lab/Nemotron-3.5-Bolt-TensorFold-DGX-Spark](https://github.com/MiaAI-Lab/Nemotron-3.5-Bolt-TensorFold-DGX-Spark) | 262,144 | 73.7 prose · 137.3 code · 240.3 across 8 · 16 streams, 23 GB of weights |
 | **Nemotron 3.5 Lightning** 30B-A3B (SGLang, DSpark) | [MiaAI-Lab/Nemotron3.5-Lightning-DGX-Spark-RTX-5090-6000-PRO](https://github.com/MiaAI-Lab/Nemotron3.5-Lightning-DGX-Spark-RTX-5090-6000-PRO) | 1,048,576 | ≈124 · ≈355 across 8 (community measurement with vLLM; the recipe publishes none) |
 | **Laguna S 2.1** 118B (vLLM 0.25.1, NVFP4, DFlash) | [MiaAI-Lab/Laguna-S-2.1-DGX-Spark-RTX-6000-PRO](https://github.com/MiaAI-Lab/Laguna-S-2.1-DGX-Spark-RTX-6000-PRO) | 262,144 | 76.7 · 139.6 across 4 (the recipe's chart) |
+| **Inkling 2 Mini** 26B-A3B looped MoE (vLLM Inkling build, NVFP4 + MXFP8, DSpark) — takes images | [thinkingmachines/Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) · [vLLM recipe](https://recipes.vllm.ai/thinkingmachines/Inkling-2-Mini) | 262,144 (1,048,576 native) | ≈35.9 · ≈80.9 across 4 (a Spark owner's [forum measurement](https://forums.developer.nvidia.com/t/inkling-2-mini/389745) on another engine; measured on your box) · 20 GB of weights |
 | Ornith 1.5 122B EXL3 4-bit (ExLlamaV3 + TabbyAPI) — *experimental* | [Mia-AiLab/Ornith-1.5-122B-EXL3-EAQv1-4-bpw](https://huggingface.co/Mia-AiLab/Ornith-1.5-122B-EXL3-EAQv1-4-bpw) | 131,072 (262,144 native) | not published — measured on your box |
 | Qwen3.8 Flash Next, NVIDIA FP4 (vLLM b12x) | [nvidia/Qwen3.8-Flash-Next-FP4-Local](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-FP4-Local) | 262,144 | not published — measured on your box; shares its weights with the TensorFold recipe |
 | Qwen3.8 27B (SGLang, EAGLE) | [MiaAI-Lab/Qwen3.8-27B-SGLang-DGX-Spark](https://github.com/MiaAI-Lab/Qwen3.8-27B-SGLang-DGX-Spark) | 1,000,000 | 24.2 code · ~18 prose |
 | Qwen3.8 Flash Next (vLLM) — *superseded by the TensorFold recipe* | [MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark) | 524,288 | 48.7 · 162.9 across 8 |
 
-Flash Next's TensorFold recipe moved to NVIDIA's quantization-aware-distilled FP4
-checkpoint (GPQA Diamond 91.5 % against 92.2 % for bf16) on a new Zig engine: prefill is
-13–15 % faster than before and the checkpoint is closer to full precision, but single-stream
-decode is about 50 tok/s rather than the 64 the earlier INT4 build showed, and a start needs
-about 108 GiB free (it loads ~81 GiB) and ~160 GB of disk. Spark Swapper measures every model on
-your box when it loads it and shows that next to the published figure.
+Flash Next's TensorFold recipe serves NVIDIA's quantization-aware-distilled FP4 checkpoint
+(GPQA Diamond 91.5 % against 92.2 % for bf16) on TensorFold v1.2.7: against the v1.1.4 build,
+decode is 1 % faster alone and 37 % faster across five chats, and time to the first token is less
+than half. A start needs about 108 GiB free (it loads ~81 GiB) and ~160 GB of disk. TensorFold
+v1.2.7 has no YaRN, so the card's 512K and 1M windows run the recipe's long-context build instead
+(below). Its options (window, abliterated, video, PDFs) are under [Model options](#model-options). Spark
+Swapper measures every model on your box when it loads it and shows that next to the published
+figure.
 
 The TensorFold and Nemotron recipes run as the box's user (who is added to the
 `docker` group), bound to `127.0.0.1`; other machines reach them through the HTTPS
@@ -108,6 +111,17 @@ front, which checks the API key. The TensorFold Flash Next and Bolt servers also
 themselves (`TENSORFOLD_API_KEY`); the 27B and Lightning ones have no key of their own.
 The vLLM and TabbyAPI models are containers Spark Swapper creates itself, with
 `--api-key`, bound to `127.0.0.1`.
+
+Inkling 2 Mini isn't supported by a vLLM release yet, so its card runs vLLM's own
+Inkling build (`vllm/vllm-openai:inkling-2-mini`, the arm64 image pinned to commit
+`7cb5dae`) with the vLLM recipe's DGX Spark settings: 262,144 tokens of context, the
+`inkling` reasoning and tool-call parsers, DSpark drafts from the checkpoint's own MTP
+head. It claims half the Spark's memory (`--gpu-memory-utilization 0.5`). Images go in as
+`image_url` parts (up to 8 per request, each side 40–4,096 px). It reasons at *high*
+effort by default; send `chat_template_kwargs: {"reasoning_effort": "low"}` (or `none`,
+`minimal`, `medium`, `xhigh`, `max`) for less. Replies are capped at 32,768 tokens unless
+the request sets `max_tokens`, because the model card warns of long reasoning loops. If
+the DSpark drafts won't start on your box, drop `--speculative-config` in a site override.
 
 Weights live in the shared Hugging Face cache (`~/.cache/huggingface/hub`), so two models
 that use the same checkpoint — the Flash Next recipe and the vLLM FP4 card — take the disk
@@ -195,9 +209,63 @@ folders themselves, never anything a link points at. **Other things on the disk*
 checkpoints and images that no model accounts for (such as the INT4 Flash Next checkpoint
 older recipes left) so they can be cleaned up too.
 
+### Model options
+
+**Options…** on a card changes what that model starts with, for the cards whose catalog entry
+offers any (`contexts` and `switches`). A model that isn't serving keeps the choice for the next
+time it's switched to; the one that is serving restarts with it, as a job with steps and a log,
+and comes back as it was if it won't start. Choices are kept per model in the state dir
+(`contexts` and `switches` in `state.json`), so they survive restarts and updates; the site
+config isn't touched. The card's chips and the *Now serving* line say what's set.
+
+**Qwen3.8 Flash Next (TensorFold)**:
+
+- **Context window: 256K, 128K, 512K or 1M.** 256K, five chats at once, is the recipe's default and
+  the longest window TensorFold v1.2.7 serves. 128K serves two chats and raises the engine's memory
+  reserve (`TENSORFOLD_MEMORY_RESERVE_GIB` 28 instead of 9) so ~28 GiB stay free: room for
+  Qwen-Image beside it. The prompt cache is smaller then, and while a picture is being drawn the
+  n-gram table has less page cache, so decode can slow.
+- **512K and 1M: the long-context build.** v1.2.7 refuses a scaled rope, so the longer windows run
+  the recipe's earlier build: TensorFold `db281878` with azampatti's INT4-AutoRound checkpoint
+  (branch `zig-int4-ar`, pinned to `5b2422f`), which applies Qwen's YaRN ×4 past 262,144 tokens
+  (`TF_FLASHNEXT_YARN=4`). It is a separate checkout (`~/Qwen3.8-Flash-Next-TensorFold-LongContext`)
+  with its own container (`qwen38-flash-next-tf-long`), state folder and ~122 GiB checkpoint
+  (~160 GB of disk, 1–2 hours): **Install it** next to those windows in Options… installs it while
+  the serving model keeps serving. Apps keep the same model ID, `Qwen3.8-Flash-Next`. Its memory
+  pool (~30 GiB) holds one full 1M window (17.5 GiB of fp8 cache) or three 512K ones, so 1M serves
+  up to two chats and 512K three. It reads images and video but has no abliterated or PDF input
+  (turn those off first). Its recipe measured 64.4 tok/s alone and 200.9 across eight at a 262K
+  window and publishes no run past 262K; the INT4 checkpoint scores about 10 % lower in general on
+  its authors' harness than NVIDIA's FP4.
+- **Abliterated** (`ABLIT=1`): drowzeys's Keys house-qsa overlay, the 12 attention layers' output
+  projections with the refusal direction projected out. *The model has had its safety refusals
+  removed.* The overlay is gated: accept its Responsible Use Agreement at
+  [huggingface.co/drowzeys/keys-Qwen3.8-Flash-Next-NVFP4-FP4-QAD-house-qsa-L3-47](https://huggingface.co/drowzeys/keys-Qwen3.8-Flash-Next-NVFP4-FP4-QAD-house-qsa-L3-47)
+  while signed in, and save a read token on **Settings ▸ Hugging Face**. The first start downloads
+  its ~190 MB sidecar (the checkpoint isn't downloaded again). Only an admin signed in to the page
+  can turn it on; app connections can't. The token goes to the recipe only while this switch is on.
+  The recipe has booted it, but its accuracy and refusal checks haven't been run on it yet.
+- **Video input** (`VIDEO=1`, experimental) and **PDF input** (`PDF=1`): video parts and PDF
+  document parts, through the image path (they share its 50-image budget). The recipe builds both
+  but hasn't run a live video request yet.
+- **Thinking by default** (`THINKING`): on, as the recipe ships it; off answers without reasoning
+  unless a request asks for it (`chat_template_kwargs`).
+
+**Measure speed** on the serving card times one reply again (thinking off) without restarting it.
+A switch or restart that is running has a **Cancel** button: it stops at the next safe point
+(while it waits for memory or for the model to answer) and brings back what was serving, the
+way a failed switch does.
+
+Abliterated, video and PDF need the v1.2.7 recipe. A box that installed Flash Next earlier
+offers **Update recipe…** in the card's Details: it pulls the recipe and runs its `prepare.sh`,
+which builds the new engine image (about an hour; no image is published for v1.2.7 yet) without
+downloading the weights again. The model keeps serving meanwhile and uses the new version on its
+next start.
+
 ### Pictures and the context window
 
-**Pictures & context** on the Models tab, while a Qwen3.8 Flash Next (vLLM) model serves:
+**Options & pictures** on the Models tab shows the serving model's window and settings, and the
+pictures switch. With a Qwen3.8 Flash Next (vLLM) model serving:
 
 - **Context window: 256K or 512K.** 256K is the model's native window; its KV pool is smaller
   (`HOST_RESERVE_GIB` 37 instead of the recipe's 26), which leaves ~11 GiB more free — room for
@@ -209,7 +277,8 @@ older recipes left) so they can be cleaned up too.
 - **Pictures on/off** for Qwen-Image: ComfyUI as the box user's `qwen-image.service`, which
   `~/.local/bin/qwen-image` starts when a picture is asked for (and refuses to start with less than
   22 GiB free, so it can't push the model under its watchdog's floor). Off stops ComfyUI at once;
-  on is refused at 512K, and switching to 512K turns pictures off first. The checks under it say
+  on is refused at a window without room for it (512K on the vLLM card, 256K on the TensorFold
+  one), and switching to such a window turns pictures off first. The checks under it say
   what's in the way, and **Activity** shows what changed and the service's own log.
 
 `deploy/pictures/` has that setup: the `qwen-image` command (`--status` says whether a picture can be
@@ -305,8 +374,13 @@ App tokens go in `Authorization: Bearer sst_…` on any `/api/*` call a signed-i
 make, except managing users, tokens, passwords and updates. Useful endpoints:
 `GET /api/status` (models with `installed`, `perf`, `measured`, `context`),
 `POST /api/swap {"target": key}`, `GET /api/connect`, `POST /api/models/install {"key": …}`,
-`GET /api/pictures` / `POST /api/pictures {"enabled": bool}`, `POST /api/context {"key": …, "tokens": 262144|524288}`
-(202 with a job when the model restarts) and `GET /api/activity`.
+`GET /api/pictures` / `POST /api/pictures {"enabled": bool}`, `POST /api/context {"key": …, "tokens": …}`,
+`POST /api/settings {"key": …, "context"?: tokens, "switches"?: {"pdf": true, …}}` (202 with a job when
+the model restarts; turning on an `admin_only` switch such as `ablit` needs an admin's browser
+session), `POST /api/models/install {"key": …, "variant": "long"}` for a card's other build,
+`POST /api/swap/cancel`, `POST /api/measure` (the serving model; `/api/status` says `measuring`)
+and `GET /api/activity`. Each model in `/api/status` lists its `contexts`, `switches` and
+`inputs`.
 Everything about storage (`/api/storage`), deleting models, adding one from Hugging Face and the
 Hugging Face token needs a signed-in browser session — app tokens are refused, and the changes
 are admin-only.

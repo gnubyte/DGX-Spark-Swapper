@@ -213,7 +213,7 @@ async function poll() {
     $("now-sub").textContent = e.message;
     $("now-dot").className = "pulse bad";
   }
-  const busy = status && (status.busy || status.loading || (status.install_job && status.install_job.state === "running"));
+  const busy = status && (status.busy || status.loading || status.measuring || (status.install_job && status.install_job.state === "running"));
   pollTimer = setTimeout(poll, busy ? 1500 : 5000);
 }
 
@@ -244,6 +244,24 @@ function perfChips(m) {
   return out;
 }
 
+// What a model reads besides text: its catalog "inputs", else images and video for an old "vision" card.
+const modelInputs = (m) => m.inputs || (m.vision ? ["images", "video"] : []);
+function inputsLabel(list) {
+  if (!list.length) return "";
+  const w = list.map((x, i) => (i === 0 ? x[0].toUpperCase() + x.slice(1) : x));
+  return w.length === 1 ? w[0] : `${w.slice(0, -1).join(", ")} & ${w[w.length - 1]}`;
+}
+// A catalog phrase ("1–2 hours: downloads …") as a sentence: capital first, full stop last.
+const sentence = (t) => (t ? `${t[0].toUpperCase()}${t.slice(1)}${/[.!?]$/.test(t) ? "" : "."}` : "");
+// "Abliterated" → "abliterated", but "PDF input" keeps its capitals.
+const lc1 = (t) => (t && !/^[A-Z]{2}/.test(t) ? t[0].toLowerCase() + t.slice(1) : t);
+// The switches set differently from the card's default, in words: ["Abliterated", "Quick answers by default"]. Those
+// that only add an input (video, PDFs) are left out: the inputs chip already says so.
+function changedSwitches(m) {
+  return (m.switches || []).filter((x) => x.on !== x.default && !(x.on && x.adds_input))
+    .map((x) => (x.on ? x.label : x.off_label || `${x.label}: off`));
+}
+
 function render() {
   const s = status;
   if (!s) return;
@@ -267,9 +285,10 @@ function render() {
   const dot = $("now-dot");
   if (running) {
     dot.className = "pulse busy";
-    const ctx = job.kind === "context";
-    $("now-eyebrow").textContent = ctx ? "Restarting" : "Switching";
-    $("now-title").textContent = ctx ? `${modelTitle(job.target)} → ${fmtCtx(job.context)}` : `Moving to ${modelTitle(job.target)}`;
+    const restart = job.kind === "context" || job.kind === "settings";
+    $("now-eyebrow").textContent = restart ? "Restarting" : "Switching";
+    $("now-title").textContent = !restart ? `Moving to ${modelTitle(job.target)}`
+      : `${modelTitle(job.target)} → ${job.kind === "settings" ? job.change : fmtCtx(job.context)}`;
     $("now-sub").textContent = "Sit back — this runs on its own. You can close this page.";
   } else if (s.active) {
     const m = s.models[s.active];
@@ -277,7 +296,9 @@ function render() {
     $("now-eyebrow").textContent = "Now serving";
     $("now-title").textContent = m.title;
     const rate = m.measured && m.measured.decode ? ` · ${fmtRate(m.measured.decode)} tok/s here` : "";
-    $("now-sub").textContent = `${fmtCtx(m.served_context || m.context)} context · ${m.served_id}${rate}`;
+    const reads = inputsLabel(modelInputs(m));
+    const opts = changedSwitches(m).map((x) => ` · ${lc1(x)}`).join("");
+    $("now-sub").textContent = `${fmtCtx(m.served_context || m.context)} context · ${m.served_id}${reads ? ` · reads ${lc1(reads)}` : ""}${opts}${rate}`;
   } else if (s.loading) {
     dot.className = "pulse busy";
     $("now-eyebrow").textContent = "Starting up";
@@ -298,6 +319,10 @@ function render() {
     title: $("progress-title"), time: $("progress-time"), steps: $("steps"), note: $("progress-note"),
     log: $("log"), logWrap: $("log-wrap"),
   }, "swap");
+  const cancel = $("progress-cancel");
+  cancel.hidden = !running;
+  cancel.disabled = !!(job && job.cancel_requested);
+  cancel.textContent = job && job.cancel_requested ? "Cancelling…" : "Cancel";
   const ij = s.install_job;
   const modelJob = ij && (ij.target.startsWith("install:model:") || ij.target.startsWith("delete:")) ? ij : null;
   renderJob($("minstall"), modelJob, {
@@ -344,10 +369,18 @@ function renderTuning(s, running) {
   const pics = s.pictures;
   const m = s.active ? s.models[s.active] : null;
   const contexts = m && m.contexts;
+  const switches = m && m.switches;
   const box = $("tuning");
-  box.hidden = !(contexts || (pics && pics.installed));
+  box.hidden = !(contexts || switches || (pics && pics.installed));
   if (box.hidden) return;
   $("tuning-sub").textContent = m ? m.title : "";
+
+  $("opt-row").hidden = !switches;
+  if (switches) {
+    $("opt-note").textContent = switches.map((x) => `${x.label}: ${x.on ? "on" : "off"}`).join(" · ");
+    $("btn-opts").disabled = running || s.busy;
+    $("btn-opts").onclick = () => openOptions(m);
+  }
 
   $("ctx-row").hidden = !contexts;
   if (contexts) {
@@ -357,14 +390,14 @@ function renderTuning(s, running) {
     for (const c of contexts) {
       const b = el("button", `seg-btn${served === c.tokens ? " on" : ""}`, c.label);
       b.type = "button";
-      b.title = c.detail;
-      b.disabled = running || s.busy || served === c.tokens;
+      b.title = c.installed === false ? `${c.detail} — runs ${c.variant_label}, which isn't installed yet (Options… installs it)` : c.detail;
+      b.disabled = running || s.busy || served === c.tokens || c.installed === false;
       b.addEventListener("click", () => changeContext(m, c));
       seg.append(b);
     }
     const cur = contexts.find((c) => c.tokens === served);
     $("ctx-note").textContent = cur
-      ? `${cur.label}: ${cur.detail}. Changing it restarts the model (${m.eta || "about 11 minutes"}).`
+      ? `${cur.label}: ${cur.detail}. Changing it restarts the model — ${m.eta || "about 11 minutes"}.`
       : `Serving ${fmtCtx(served)}.`;
   }
 
@@ -414,6 +447,121 @@ async function changeContext(m, c) {
   poll();
 }
 
+/* Options… on a card (and on the panel for the model serving): its window and its on/off settings. A model that is
+   serving restarts with them; any other keeps them for the next time it's switched to. */
+let optsFor = null;
+
+function openOptions(m) {
+  optsFor = m.key;
+  const serving = status.active === m.key;
+  $("opts-title").textContent = `${m.title}: options`;
+  $("opts-intro").textContent = serving
+    ? `It's serving now, so saving restarts it with the new settings (${m.eta || "a few minutes"}); the API can't answer meanwhile. If it won't start, it comes back as it was.`
+    : "Kept for the next time you switch to it — nothing restarts now.";
+  const body = $("opts-body");
+  body.replaceChildren();
+  if (m.contexts) {
+    const fs = el("fieldset", "opt-group");
+    fs.append(el("legend", "", "Context window"));
+    for (const c of m.contexts) {
+      const l = el("label", "check opt");
+      const r = el("input");
+      r.type = "radio"; r.name = "opt-ctx"; r.value = String(c.tokens); r.checked = c.tokens === m.context;
+      r.disabled = c.installed === false && c.tokens !== m.context;
+      const txt = el("span");
+      txt.append(el("strong", "", c.label), document.createTextNode(` — ${c.detail}`));
+      if (c.pictures && status.pictures && status.pictures.installed) txt.append(el("span", "opt-why", "Pictures (Qwen-Image) fit beside this window."));
+      if (c.variant && c.installed) txt.append(el("span", "opt-why", `Runs ${c.variant_label} — installed.`));
+      if (c.variant && c.installed === false) {
+        const i = c.install || {};
+        txt.append(el("span", "opt-why", `Runs ${c.variant_label}, which isn't installed yet${i.size_gb ? ` (~${i.size_gb} GB of disk` : ""}${i.time ? `${i.size_gb ? ", " : " ("}${i.time.split(":")[0]})` : i.size_gb ? ")" : ""}.`));
+        const b = el("button", "btn ghost small opt-install", "Install it");
+        b.type = "button";
+        b.disabled = !!(status.install_job && status.install_job.state === "running");
+        b.addEventListener("click", (ev) => { ev.preventDefault(); installVariant(m, c); });
+        txt.append(b);
+      }
+      l.append(r, txt);
+      fs.append(l);
+    }
+    body.append(fs);
+  }
+  if (m.switches) {
+    const fs = el("fieldset", "opt-group");
+    fs.append(el("legend", "", "Settings"));
+    for (const x of m.switches) {
+      const l = el("label", "check opt");
+      const cb = el("input");
+      cb.type = "checkbox"; cb.dataset.sw = x.name; cb.checked = x.on;
+      const adminOnly = x.admin_only && me.role !== "admin";
+      cb.disabled = (!x.on && (!x.available || adminOnly));
+      const txt = el("span");
+      txt.append(el("strong", "", x.label));
+      if (x.experimental) txt.append(document.createTextNode(" "), el("span", "tag exp", "Experimental"));
+      txt.append(document.createTextNode(` — ${x.detail}`));
+      if (x.warn) txt.append(el("span", "opt-warn", x.warn));
+      if (!x.on && !x.available && x.why) txt.append(el("span", "opt-why", x.why));
+      else if (!x.on && adminOnly) txt.append(el("span", "opt-why", "Only an admin can turn this on."));
+      if (x.gated_repo) {
+        const a = el("a", "opt-link", "Its terms on Hugging Face ↗");
+        a.href = `https://huggingface.co/${x.gated_repo}`; a.target = "_blank"; a.rel = "noopener noreferrer";
+        txt.append(a);
+      }
+      l.append(cb, txt);
+      fs.append(l);
+    }
+    body.append(fs);
+  }
+  $("opts-ok").textContent = serving ? "Save and restart" : "Save";
+  $("opts-err").textContent = "";
+  $("opts").showModal();
+}
+
+async function installVariant(m, c) {
+  const i = c.install || {};
+  const ok = await ask(`Install ${c.variant_label}?`,
+    `${c.label} runs ${c.variant_label}: a separate checkout of the recipe with its own engine image and checkpoint. ` +
+    `${sentence(i.time) || "It downloads and builds it."}${i.size_gb ? ` It needs about ${i.size_gb} GB of free disk.` : ""} ` +
+    `Whatever is serving keeps serving meanwhile; choose ${c.label} in Options… when it has finished.`, "Install");
+  if (!ok) return;
+  try {
+    await api("/api/models/install", { key: m.key, variant: c.variant });
+    $("opts").close();
+    lastInstallLogLen = -1;
+    toast(`Installing ${c.variant_label}…`);
+    poll();
+  } catch (e) { $("opts-err").textContent = e.message; }
+}
+
+$("opts-ok").addEventListener("click", async (ev) => {
+  ev.preventDefault();
+  const m = status && status.models[optsFor];
+  if (!m) { $("opts").close(); return; }
+  const body = { key: m.key };
+  const r = $("opts-body").querySelector('input[name="opt-ctx"]:checked');
+  if (r && +r.value !== m.context) body.context = +r.value;
+  const sw = {};
+  for (const cb of $("opts-body").querySelectorAll("input[data-sw]")) {
+    const x = (m.switches || []).find((y) => y.name === cb.dataset.sw);
+    if (x && cb.checked !== x.on) sw[x.name] = cb.checked;
+  }
+  if (Object.keys(sw).length) body.switches = sw;
+  if (body.context === undefined && !body.switches) { $("opts").close(); return; }
+  const btn = $("opts-ok");
+  btn.disabled = true;
+  try {
+    const res = await api("/api/settings", body);
+    $("opts").close();
+    lastLogLen = -1;
+    toast(res.restarting ? `Restarting ${m.title}…` : `Saved — ${m.title} uses it the next time you switch to it.`);
+  } catch (e) {
+    $("opts-err").textContent = e.message;
+  } finally {
+    btn.disabled = false;
+    poll();
+  }
+});
+
 async function togglePictures(ev) {
   const on = ev.target.checked;
   try {
@@ -431,7 +579,7 @@ function card(m, s, running, installing) {
   const c = el("article", "card");
   const isActive = s.active === m.key && !running;
   const isLoading = (running && s.job.target === m.key) || (!running && s.loading === m.key);
-  const isInstalling = installing && installing.target === `install:model:${m.key}`;
+  const isInstalling = installing && (installing.target === `install:model:${m.key}` || installing.target.startsWith(`install:model:${m.key}@`));
   if (isActive) c.classList.add("active");
   if (isLoading || isInstalling) c.classList.add("loading");
   if (!m.installed) c.classList.add("missing");
@@ -446,13 +594,25 @@ function card(m, s, running, installing) {
   c.append(head, el("div", "engine", m.engine), el("p", "muted", m.tagline));
 
   const chips = el("div", "chips");
-  chips.append(el("span", "chip", `${fmtCtx(m.context)} context`));
+  const ctxChip = el("span", "chip", `${fmtCtx(m.context)} context`);
+  if (m.contexts) ctxChip.title = `Can also be served at ${m.contexts.filter((c) => c.tokens !== m.context).map((c) => c.label).join(" or ")} — Options…`;
+  chips.append(ctxChip);
   for (const p of perfChips(m)) chips.append(p);
-  if (m.vision) chips.append(el("span", "chip", "Images & video"));
+  const reads = inputsLabel(modelInputs(m));
+  if (reads) {
+    const r = el("span", "chip", reads);
+    r.title = `Takes ${lc1(reads)} as input, besides text.`;
+    chips.append(r);
+  }
+  for (const x of (m.switches || []).filter((y) => y.on !== y.default && !(y.on && y.adds_input))) {
+    const o = el("span", `chip opt${x.warn && x.on ? " optwarn" : ""}`, x.on ? x.label : x.off_label || `${x.label}: off`);
+    o.title = x.detail;
+    chips.append(o);
+  }
   if (m.disk_bytes) chips.append(el("span", "chip disk", `${fmtBytes(m.disk_bytes)} on disk`));
   if (isActive) chips.append(el("span", "chip on", "Serving now"));
   if (isLoading) chips.append(el("span", "chip wait", "Loading"));
-  if (isInstalling) chips.append(el("span", "chip wait", "Installing"));
+  if (isInstalling) chips.append(el("span", "chip wait", m.installed ? "Updating" : "Installing"));
   else if (!m.installed) chips.append(el("span", "chip off", "Not installed"));
   c.append(chips);
 
@@ -474,6 +634,13 @@ function card(m, s, running, installing) {
     a.href = m.repo; a.target = "_blank"; a.rel = "noopener noreferrer";
     const pa = el("p"); pa.append(a); more.append(pa);
   }
+  if (m.installed && m.updatable) {
+    const u = el("button", "btn ghost small", isInstalling ? "Updating…" : "Update recipe…");
+    u.disabled = !!installing || isLoading;
+    u.title = "Pull the newest version of its recipe and prepare it.";
+    u.addEventListener("click", () => confirmUpdate(m, isActive));
+    const pu = el("p"); pu.append(u); more.append(pu);
+  }
   c.append(more, el("div", "spacer"));
 
   const actions = el("div", "actions");
@@ -483,6 +650,21 @@ function card(m, s, running, installing) {
     b.disabled = isActive || running;
     b.addEventListener("click", () => confirmSwap(m));
     actions.append(b);
+    if (isActive) {
+      const busy = s.measuring === m.key;
+      const ms = el("button", "btn ghost small", busy ? "Measuring…" : "Measure speed");
+      ms.disabled = busy || running || !!s.measuring;
+      ms.title = "Time one reply from it again (thinking off) — nothing restarts.";
+      ms.addEventListener("click", () => measureAgain(m));
+      actions.append(ms);
+    }
+    if (m.contexts || m.switches) {
+      const o = el("button", "btn ghost small", "Options…");
+      o.disabled = running || isLoading;
+      o.title = isActive ? "Change its window or settings (it restarts)." : "Choose its window and settings for the next time it starts.";
+      o.addEventListener("click", () => openOptions(m));
+      actions.append(o);
+    }
   } else {
     const b = el("button", "btn primary", isInstalling ? "Installing…" : "Install");
     b.disabled = !!installing;
@@ -508,7 +690,9 @@ function jobTitle(job) {
   const t = job.target || "";
   const run = job.state === "running", done = job.state === "done";
   if (t.startsWith("install:model:")) {
-    const n = modelTitle(t.slice("install:model:".length));
+    const [k, variant] = t.slice("install:model:".length).split("@");
+    const n = variant ? `${modelTitle(k)}'s long-context build` : modelTitle(k);
+    if (job.kind === "update") return run ? `Updating ${n}` : done ? `Updated ${n}` : `Couldn't update ${n}`;
     return run ? `Installing ${n}` : done ? `Installed ${n}` : `Couldn't install ${n}`;
   }
   if (t.startsWith("delete:")) {
@@ -531,6 +715,9 @@ function renderJob(box, job, ids, kind) {
   if (kind === "swap" && job.kind === "context") {
     const t = modelTitle(job.target), c = fmtCtx(job.context);
     title = job.state === "running" ? `Restarting ${t} at ${c}` : job.state === "done" ? `${t} serves ${c}` : `Couldn't change ${t} to ${c}`;
+  } else if (kind === "swap" && job.kind === "settings") {
+    const t = modelTitle(job.target), c = job.change || "new settings";
+    title = job.state === "running" ? `Restarting ${t}: ${c}` : job.state === "done" ? `${t} restarted: ${c}` : `Couldn't change ${t}: ${c}`;
   } else if (kind === "swap") {
     const t = modelTitle(job.target);
     title = job.state === "running" ? `Switching to ${t}` : job.state === "done" ? `Switched to ${t}` : `Couldn't switch to ${t}`;
@@ -599,9 +786,12 @@ function ask(title, body, okLabel) {
 
 async function confirmSwap(m) {
   const cur = status.active ? status.models[status.active].title : null;
+  const opts = changedSwitches(m);
+  const withOpts = m.contexts || opts.length
+    ? ` It starts with a ${fmtCtx(m.context)} window${opts.length ? `, ${opts.map(lc1).join(", ")}` : ""} (Options… on its card changes that).` : "";
   const ok = await ask(`Switch to ${m.title}?`,
     (cur ? `${cur} will stop, then ` : "") +
-    `${m.title} loads (${m.eta || "a few minutes"}). OpenClaw is repointed automatically, and the API at :11443 keeps the same address and key. ` +
+    `${m.title} loads (${m.eta || "a few minutes"}).${withOpts} OpenClaw is repointed automatically, and the API at :11443 keeps the same address and key. ` +
     "If the new model fails to start, the previous one is brought back.", "Switch");
   if (!ok) return;
   try {
@@ -615,7 +805,7 @@ async function confirmSwap(m) {
 async function confirmInstall(m) {
   const i = m.install || {};
   const ok = await ask(`Install ${m.title}?`,
-    `${i.time || "This downloads the model and sets it up."}${i.size_gb ? ` It needs about ${i.size_gb} GB of free disk.` : ""} ` +
+    `${sentence(i.time) || "This downloads the model and sets it up."}${i.size_gb ? ` It needs about ${i.size_gb} GB of free disk.` : ""} ` +
     "It runs on the box by itself — you can close this page — and the model that's serving now keeps serving." +
     (i.note ? ` ${i.note}` : ""), "Install");
   if (!ok) return;
@@ -623,6 +813,46 @@ async function confirmInstall(m) {
     await api("/api/models/install", { key: m.key });
     lastInstallLogLen = -1;
     toast(`Installing ${m.title}…`);
+    poll();
+  } catch (e) { toast(e.message); }
+}
+
+async function measureAgain(m) {
+  try {
+    await api("/api/measure", {});
+    toast(`Measuring ${m.title}… one reply, about half a minute.`);
+  } catch (e) { toast(e.message); }
+  poll();
+}
+
+$("progress-cancel").addEventListener("click", async () => {
+  const job = status && status.job;
+  if (!job || job.state !== "running") return;
+  const t = modelTitle(job.target);
+  const back = job.kind === "swap" ? (job.source && job.source !== job.target ? modelTitle(job.source) : null) : t;
+  const ok = await ask(job.kind === "swap" ? `Stop switching to ${t}?` : `Stop restarting ${t}?`,
+    "It stops at the next safe point (while it waits for memory or for the model to answer) — a step that is running, " +
+    "such as stopping a model, finishes first. " +
+    (back ? `Then ${back} is brought back${job.kind === "swap" ? "" : " with its previous settings"}.` : "Then nothing is serving until you switch to a model."),
+    "Cancel the switch");
+  if (!ok) return;
+  try { await api("/api/swap/cancel", {}); toast("Cancelling…"); } catch (e) { toast(e.message); }
+  poll();
+});
+
+async function confirmUpdate(m, serving) {
+  const i = m.install || {};
+  const ok = await ask(`Update ${m.title}'s recipe?`,
+    "Pulls the newest version of its recipe from GitHub and prepares it — a new engine image is built if the recipe " +
+    "changed it, and weights that are already downloaded aren't fetched again. It runs on the box by itself. " +
+    (serving ? "The model keeps serving meanwhile and uses the new version the next time it starts (switch to it again, or change an option)."
+      : "The new version is used the next time you switch to it.") +
+    (i.note ? ` ${i.note}` : ""), "Update");
+  if (!ok) return;
+  try {
+    await api("/api/models/install", { key: m.key });
+    lastInstallLogLen = -1;
+    toast(`Updating ${m.title}…`);
     poll();
   } catch (e) { toast(e.message); }
 }
@@ -960,6 +1190,23 @@ async function loadHfToken() {
     const r = await api("/api/hf/token");
     $("hf-token-status").textContent = r.set ? `A token is set (${r.source}).` : "No token is set. Public models don't need one.";
     $("btn-hf-token-clear").hidden = r.source !== "settings";
+    // What on this box needs one: the settings that download something gated (Flash Next's abliterated overlay).
+    const st = status || await api("/api/status");
+    const needed = [];
+    for (const m of Object.values(st.models || {}).sort((a, b) => a.order - b.order)) {
+      for (const x of (m.switches || []).filter((y) => y.needs_hf_token)) needed.push({ m, x });
+    }
+    const ul = $("hf-needed");
+    ul.replaceChildren(...needed.map(({ m, x }) => {
+      const li = rich("li", `**${m.title} ▸ ${x.label}**${x.on ? " (on)" : ""} — `);
+      if (x.gated_repo) {
+        const a = el("a", "", `accept its terms on Hugging Face ↗`);
+        a.href = `https://huggingface.co/${x.gated_repo}`; a.target = "_blank"; a.rel = "noopener noreferrer";
+        li.append(a);
+      } else li.append(document.createTextNode("downloads a gated file"));
+      return li;
+    }));
+    ul.hidden = !needed.length;
   } catch (e) { if (e.status === 401) boot(); }
 }
 
@@ -1163,9 +1410,20 @@ const TOOLS = [
   { key: "claude", label: "Claude Code", build: (v) => v.anthropic ? [
     rich("p", `The model serving now also speaks the Anthropic Messages API, so Claude Code can use it:`),
     snip(`export ANTHROPIC_BASE_URL="${v.base.replace(/\/v1$/, "")}"\nexport ANTHROPIC_AUTH_TOKEN="${v.key}"\nexport ANTHROPIC_MODEL="${v.model}"\nexport NODE_EXTRA_CA_CERTS="$HOME/spark-swapper.crt"\nclaude`),
-    rich("p", "This works only while a model that speaks that API is serving (**Qwen3.8 Flash Next** or **Nemotron 3.5 Bolt**, both on TensorFold). With other models, use an OpenAI-compatible tool."),
+    rich("p", `This works only while a model that speaks that API is serving (${v.anthropicModels.map((t) => `**${t}**`).join(" or ") || "see the Models tab"}). With other models, use an OpenAI-compatible tool.`),
   ] : [
-    rich("p", "Claude Code speaks the Anthropic Messages API. Of the models here, **Qwen3.8 Flash Next** and **Nemotron 3.5 Bolt** (both TensorFold) serve it — switch to one of them and this tab shows the settings."),
+    rich("p", `Claude Code speaks the Anthropic Messages API. Of the models here, ${v.anthropicModels.map((t) => `**${t}**`).join(" and ") || "none"} serve${v.anthropicModels.length === 1 ? "s" : ""} it — switch to ${v.anthropicModels.length === 1 ? "it" : "one of them"} on the Models tab and this shows the settings.`),
+  ] },
+  { key: "images", label: "Images", build: (v) => v.inputs.includes("images") ? [
+    rich("p", `**${v.title}** reads ${lc1(inputsLabel(v.inputs))}. Send a picture as an \`image_url\` part with a base64 \`data:\` URL — every model here takes that, while some refuse links to public images:`),
+    snip(`import base64\nimport httpx\nfrom openai import OpenAI\n\nclient = OpenAI(\n    base_url="${v.base}",\n    api_key="${v.key}",\n    http_client=httpx.Client(verify="spark-swapper.crt"),\n)\nwith open("photo.jpg", "rb") as f:\n    image = base64.b64encode(f.read()).decode()\nreply = client.chat.completions.create(\n    model="${v.model}",\n    messages=[{"role": "user", "content": [\n        {"type": "text", "text": "What's in this picture?"},\n        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image}"}},\n    ]}],\n)\nprint(reply.choices[0].message.content)`, "Python"),
+    snip(`printf '{"model": "${v.model}", "messages": [{"role": "user", "content": [{"type": "text", "text": "What is in this picture?"}, {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,%s"}}]}]}' "$(base64 < photo.jpg | tr -d '\\n')" > body.json\ncurl --cacert spark-swapper.crt ${v.base}/chat/completions \\\n  -H "Authorization: Bearer ${v.key}" -H "Content-Type: application/json" --data @body.json`, "curl (macOS / Linux) — the image goes through a file, since a big one is too long for a command line"),
+    ...(v.inputs.includes("PDFs") ? [rich("p", "PDFs go in the same way, as an `image_url` with a `data:application/pdf;base64,…` URL (up to 16 pages; the pages count as images).")] : []),
+    ...(v.inputs.includes("video") ? [rich("p", "Video: a `video_url` part with a `data:video/mp4;base64,…` URL. Frames count against the same image budget, so keep clips short.")] : []),
+  ] : [
+    rich("p", v.title ? `**${v.title}** reads text only.` : "No model is serving right now."),
+    rich("p", v.visionModels.length ? `Installed models that read images: ${v.visionModels.map((t) => `**${t}**`).join(", ")}. Switch to one on the Models tab and this shows how to send a picture.`
+      : "None of the installed models reads images. Qwen3.8 Flash Next, Qwen3.8 27B and Inkling 2 Mini do — install one on the Models tab."),
   ] },
   { key: "openclaw", label: "OpenClaw", build: () => [
     rich("p", "Nothing to set up: whenever you switch models, Spark Swapper points OpenClaw at the new one (its primary, image, compaction and memory-flush models) and restarts the gateway."),
@@ -1178,7 +1436,8 @@ function renderTools() {
   if (!info) return;
   const v = {
     base: info.api_base, key: info.api_key, model: info.model || "<model id>", context: info.context,
-    boxName: info.name || "Spark", anthropic: !!info.anthropic_api,
+    boxName: info.name || "Spark", anthropic: !!info.anthropic_api, title: info.title || "",
+    inputs: info.inputs || [], anthropicModels: info.anthropic_models || [], visionModels: info.vision_models || [],
   };
   const pills = $("tool-pills");
   pills.replaceChildren();
@@ -1414,6 +1673,9 @@ async function loadUsers() {
     tr.append(el("td", "", u.username + (u.username === me.username ? " (you)" : "")));
     tr.append(el("td", "", u.role));
     tr.append(el("td", "muted", new Date(u.created * 1000).toLocaleDateString()));
+    const seen = el("td", "muted", u.last_login ? fmtWhen(u.last_login) : "not yet");
+    if (u.last_login) seen.title = new Date(u.last_login * 1000).toLocaleString();
+    tr.append(seen);
     const acts = el("td", "row end");
     const reset = el("button", "btn ghost small", "Reset password");
     reset.addEventListener("click", () => openReset(u.username));

@@ -77,7 +77,10 @@
         <section class="panel" id="progress" hidden>
           <div class="panel-head">
             <h2 id="progress-title">Switching</h2>
-            <span class="muted small" id="progress-time"></span>
+            <span class="row">
+              <span class="muted small" id="progress-time"></span>
+              <button class="btn ghost small danger" id="progress-cancel" type="button" hidden>Cancel</button>
+            </span>
           </div>
           <ol class="steps" id="steps"></ol>
           <p class="note" id="progress-note" hidden></p>
@@ -102,7 +105,7 @@
 
         <section class="panel" id="tuning" hidden>
           <div class="panel-head">
-            <h2>Pictures &amp; context</h2>
+            <h2>Options &amp; pictures</h2>
             <span class="muted small" id="tuning-sub"></span>
           </div>
           <div class="tune" id="ctx-row">
@@ -111,6 +114,13 @@
               <div class="muted small" id="ctx-note"></div>
             </div>
             <div class="seg" id="ctx-seg" role="group" aria-label="Context window"></div>
+          </div>
+          <div class="tune" id="opt-row" hidden>
+            <div>
+              <div class="tune-title">Settings</div>
+              <div class="muted small" id="opt-note"></div>
+            </div>
+            <button class="btn ghost small" id="btn-opts" type="button">Change…</button>
           </div>
           <div class="tune" id="pic-row">
             <div>
@@ -285,9 +295,9 @@
       <div id="pane-users" hidden>
         <section class="panel">
           <div class="panel-head"><h2>Users</h2><button class="btn primary small" id="btn-add-user">Add user</button></div>
-          <p class="muted small">Anyone with an account can view the running model, swap it, install models and grab connection info. Only admins can manage users and updates.</p>
+          <p class="muted small">Anyone with an account can view the running model, swap it, change a model's options (its context window, video or PDF input), install or update models and grab connection info. Only admins can manage users, updates, storage and the Hugging Face token, and only an admin signed in to this page can turn on a model's abliterated weights.</p>
           <table class="users">
-            <thead><tr><th>Username</th><th>Role</th><th>Created</th><th></th></tr></thead>
+            <thead><tr><th>Username</th><th>Role</th><th>Created</th><th>Last sign-in</th><th></th></tr></thead>
             <tbody id="users-body"></tbody>
           </table>
         </section>
@@ -314,7 +324,8 @@
         </section>
         <section class="panel">
           <div class="panel-head"><h2>Hugging Face</h2></div>
-          <p class="muted small">Only needed for models that ask you to accept their terms first (gated models). Create a token at huggingface.co/settings/tokens with <em>read</em> access; it is kept on this box and sent only to huggingface.co.</p>
+          <p class="muted small">Only needed for models that ask you to accept their terms first (gated models). Create a token at huggingface.co/settings/tokens with <em>read</em> access; it is kept on this box and sent only to huggingface.co. Accept a gated model's terms on its Hugging Face page with the same account.</p>
+          <ul class="hf-needed" id="hf-needed" hidden></ul>
           <p id="hf-token-status" class="small"></p>
           <div class="row wrap">
             <input id="hf-token" type="password" autocomplete="off" spellcheck="false" placeholder="hf_…" aria-label="Hugging Face token">
@@ -352,6 +363,19 @@
       <div class="row end">
         <button class="btn ghost" value="cancel">Keep it</button>
         <button class="btn primary danger-fill" value="ok" id="del-ok">Delete</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="opts" class="wide">
+    <form id="opts-form" method="dialog">
+      <h3 id="opts-title">Options</h3>
+      <p class="muted small" id="opts-intro"></p>
+      <div id="opts-body"></div>
+      <p id="opts-err" class="err" role="alert"></p>
+      <div class="row end">
+        <button class="btn ghost" value="cancel" formnovalidate>Cancel</button>
+        <button class="btn primary" id="opts-ok" value="ok">Save</button>
       </div>
     </form>
   </dialog>

@@ -369,3 +369,20 @@ dialog.wide { width: min(640px, calc(100vw - 32px)); max-height: calc(100vh - 48
 .checks li.bad { color: var(--ink); }
 .checks li.bad::before { content: "✗"; color: var(--bad); }
 @media (max-width: 560px) { .tune { flex-wrap: wrap; } }
+
+/* Options… : a card's window and its on/off settings */
+.chip.opt { background: var(--accent-soft); color: var(--accent); border-color: transparent; }
+.chip.opt.optwarn { background: var(--warm-soft); color: var(--warm); font-weight: 600; }
+.opt-group { border: 1px solid var(--line); border-radius: 12px; padding: 4px 14px 6px; margin: 12px 0; }
+.opt-group legend { font-weight: 600; padding: 0 6px; font-size: 14px; }
+label.check.opt { margin: 10px 0; line-height: 1.45; }
+label.check.opt strong { font-weight: 600; }
+label.check.opt .tag { font-size: 11px; padding: 1px 7px; border-radius: 999px; vertical-align: 1px; }
+.opt-warn, .opt-why, .opt-link { display: block; font-size: 13px; margin-top: 4px; }
+.opt-warn { color: var(--warm); }
+.opt-why { color: var(--muted); }
+.cards .actions .btn.small { align-self: center; }
+.hf-needed { margin: 6px 0 10px; padding-left: 18px; font-size: 13px; color: var(--muted); }
+.hf-needed li { margin: 3px 0; }
+.opt-group .tag.exp { background: var(--warm-soft); color: var(--warm); text-transform: uppercase; letter-spacing: .06em; }
+.opt-install { margin-top: 6px; }
