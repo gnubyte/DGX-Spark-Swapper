@@ -275,8 +275,78 @@
       ]
     },
 
-    "ornith": {
+    "inkling": {
       "order": 6,
+      "platforms": ["nvidia-gb10"],
+      "family": "inkling-2-mini",
+      "title": "Inkling 2 Mini",
+      "tagline": "Thinking Machines' looped 26B MoE (3.4B active) in 20 GB: images in, reasoning, tool calling and 256K context, with most of the Spark left free.",
+      "engine": "vLLM (Inkling build) · NVFP4 + MXFP8 · DSpark drafts",
+      "kind": "docker",
+      "container": "swapper-inkling-2-mini",
+      "served_id": "inkling-2-mini",
+      "context": 262144,
+      "vision": true,
+      "template_kwargs": { "reasoning_effort": "none" },
+      "min_free_gib": 64,
+      "start_timeout_s": 2700,
+      "eta": "several minutes the first time (CUDA-graph capture); a few minutes after",
+      "openclaw_provider": "inkling",
+      "openclaw_model_name": "Inkling 2 Mini 26B-A3B NVFP4 (vLLM, DSpark, images, 256K ctx)",
+      "openclaw_context": 262144,
+      "perf": {
+        "decode": 35.9, "decode_concurrent": 80.9, "concurrency": 4, "prefill": 3176.0,
+        "source": "a DGX Spark owner's llama-benchy run on the NVIDIA forum (NVFP4 with MTP drafts, served by a third-party engine, not this vLLM build): 35.9 tok/s alone, 80.9 across 4, prefill ≈3,176 tok/s. Spark Swapper measures the vLLM build after the first load",
+        "estimate": true
+      },
+      "repo": "https://huggingface.co/thinkingmachines/Inkling-2-Mini",
+      "notes": [
+        "Takes images as input (each side 40–4,096 px), sent as image_url parts in the OpenAI chat API; no audio. Video is not listed as an input.",
+        "Inkling support isn't in a vLLM release yet: this uses vLLM's own Inkling build (vllm/vllm-openai:inkling-2-mini, arm64, pinned to commit 7cb5dae) and the vLLM recipe's DGX Spark settings, which cap the 1M native context at 262,144.",
+        "Reasoning comes back in message.reasoning; the default effort is high. Send chat_template_kwargs {\"reasoning_effort\": \"low\"} (none, minimal, low, medium, high, xhigh, max) for shorter thinking. The model card warns it can get stuck in long reasoning loops, so replies are capped at 32,768 tokens unless the request sets max_tokens.",
+        "If the DSpark drafts fail to start on your box, remove the --speculative-config argument in a site override (models.json): about 35 tok/s is reported without them too."
+      ],
+      "install": {
+        "requires": ["docker"],
+        "size_gb": 35,
+        "time": "20–40 minutes: pulls the ~11 GB vLLM image and downloads ~20 GB of weights",
+        "note": "Needs about 35 GB of free disk. Weights go to the Hugging Face cache, shared with the recipes.",
+        "steps": [
+          { "do": "mkdirs", "paths": ["{{HOME}}/.cache/huggingface", "{{HOME}}/.cache/vllm", "{{HOME}}/.cache/flashinfer", "{{HOME}}/.triton"] },
+          { "do": "docker_pull", "image": "vllm/vllm-openai:inkling-2-mini-arm64-7cb5dae", "timeout": 7200 },
+          { "do": "hf_snapshot", "repo": "thinkingmachines/Inkling-2-Mini", "revision": "b85c3cfa615fc413cc9af3379f491b963f3b586a" }
+        ],
+        "ready": [
+          { "docker_image_or_container": "vllm/vllm-openai:inkling-2-mini-arm64-7cb5dae", "container": "swapper-inkling-2-mini" },
+          { "hf_snapshot": "thinkingmachines/Inkling-2-Mini", "revision": "b85c3cfa615fc413cc9af3379f491b963f3b586a" }
+        ]
+      },
+      "footprint": { "dirs": ["{{HOME}}/.cache/vllm"] },
+      "docker_run": [
+        "--network", "host", "--ipc", "host", "--shm-size", "16g", "--gpus", "all",
+        "--ulimit", "memlock=-1", "--ulimit", "stack=67108864",
+        "--restart", "unless-stopped",
+        "-e", "HF_HOME=/root/.cache/huggingface", "-e", "HF_HUB_OFFLINE=1",
+        "-e", "CUTE_DSL_ARCH=sm_121a", "-e", "VLLM_WORKER_MULTIPROC_METHOD=spawn",
+        "-v", "{{HOME}}/.cache/huggingface:/root/.cache/huggingface",
+        "-v", "{{HOME}}/.cache/vllm:/root/.cache/vllm",
+        "-v", "{{HOME}}/.cache/flashinfer:/root/.cache/flashinfer",
+        "-v", "{{HOME}}/.triton:/root/.triton",
+        "--entrypoint", "bash", "vllm/vllm-openai:inkling-2-mini-arm64-7cb5dae", "-c", "exec vllm serve \"$@\"", "vllm-serve",
+        "thinkingmachines/Inkling-2-Mini", "--revision", "b85c3cfa615fc413cc9af3379f491b963f3b586a",
+        "--host", "127.0.0.1", "--port", "{{API_PORT}}", "--api-key", "{{API_KEY}}",
+        "--served-model-name", "inkling-2-mini",
+        "--tensor-parallel-size", "1", "--max-model-len", "262144", "--gpu-memory-utilization", "0.5",
+        "--max-num-seqs", "8", "--enable-prefix-caching", "--enable-chunked-prefill",
+        "--limit-mm-per-prompt", "{\"image\":8}",
+        "--reasoning-parser", "inkling", "--enable-auto-tool-choice", "--tool-call-parser", "inkling",
+        "--override-generation-config", "{\"max_new_tokens\":32768}",
+        "--speculative-config", "{\"method\":\"dspark\",\"num_speculative_tokens\":7,\"draft_sample_method\":\"probabilistic\"}"
+      ]
+    },
+
+    "ornith": {
+      "order": 7,
       "platforms": ["nvidia-gb10"],
       "family": "ornith-1.5",
       "title": "Ornith 1.5 122B",
@@ -329,7 +399,7 @@
     },
 
     "vllmfp4": {
-      "order": 7,
+      "order": 8,
       "platforms": ["nvidia-gb10"],
       "family": "qwen3.8-flash-next",
       "title": "Qwen3.8 Flash Next (NVIDIA FP4 · vLLM)",
@@ -405,7 +475,7 @@
     },
 
     "standard": {
-      "order": 8,
+      "order": 9,
       "platforms": ["nvidia-gb10"],
       "family": "qwen3.8-27b",
       "title": "Qwen3.8 27B (SGLang)",
@@ -474,7 +544,7 @@
     },
 
     "flash": {
-      "order": 9,
+      "order": 10,
       "platforms": ["nvidia-gb10"],
       "family": "qwen3.8-flash-next",
       "title": "Qwen3.8 Flash Next (vLLM)",

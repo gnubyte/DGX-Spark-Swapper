@@ -1296,8 +1296,12 @@ class Engine:
 
     @staticmethod
     def _chat_extras(m: dict) -> dict:
-        """Ask for a plain, non-thinking reply in the speed check — unless the engine refuses the field."""
-        return {"chat_template_kwargs": {"enable_thinking": False}} if m.get("template_kwargs", True) else {}
+        """Ask for a plain, non-thinking reply in the speed check — unless the engine refuses the field.
+        A model whose template switches thinking off another way names its own kwargs (a dict)."""
+        tk = m.get("template_kwargs", True)
+        if isinstance(tk, dict):
+            return {"chat_template_kwargs": dict(tk)} if tk else {}
+        return {"chat_template_kwargs": {"enable_thinking": False}} if tk else {}
 
     def measure(self, key: str, job: Job | None = None, usage: bool = True) -> dict | None:
         """Stream one ~256-token reply and time it: decode tokens per second after

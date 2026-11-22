@@ -90,6 +90,7 @@ measures every model on your box when it loads it, and shows that next to these.
 | **Nemotron 3.5 Bolt** 74B-A9B (TensorFold Zig engine, IQ2_XXS + NVFP4, LiLiCorr drafts) | [MiaAI-Lab/Nemotron-3.5-Bolt-TensorFold-DGX-Spark](https://github.com/MiaAI-Lab/Nemotron-3.5-Bolt-TensorFold-DGX-Spark) | 262,144 | 73.7 prose · 137.3 code · 240.3 across 8 · 16 streams, 23 GB of weights |
 | **Nemotron 3.5 Lightning** 30B-A3B (SGLang, DSpark) | [MiaAI-Lab/Nemotron3.5-Lightning-DGX-Spark-RTX-5090-6000-PRO](https://github.com/MiaAI-Lab/Nemotron3.5-Lightning-DGX-Spark-RTX-5090-6000-PRO) | 1,048,576 | ≈124 · ≈355 across 8 (community measurement with vLLM; the recipe publishes none) |
 | **Laguna S 2.1** 118B (vLLM 0.25.1, NVFP4, DFlash) | [MiaAI-Lab/Laguna-S-2.1-DGX-Spark-RTX-6000-PRO](https://github.com/MiaAI-Lab/Laguna-S-2.1-DGX-Spark-RTX-6000-PRO) | 262,144 | 76.7 · 139.6 across 4 (the recipe's chart) |
+| **Inkling 2 Mini** 26B-A3B looped MoE (vLLM Inkling build, NVFP4 + MXFP8, DSpark) — takes images | [thinkingmachines/Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) · [vLLM recipe](https://recipes.vllm.ai/thinkingmachines/Inkling-2-Mini) | 262,144 (1,048,576 native) | ≈35.9 · ≈80.9 across 4 (a Spark owner's [forum measurement](https://forums.developer.nvidia.com/t/inkling-2-mini/389745) on another engine; measured on your box) · 20 GB of weights |
 | Ornith 1.5 122B EXL3 4-bit (ExLlamaV3 + TabbyAPI) — *experimental* | [Mia-AiLab/Ornith-1.5-122B-EXL3-EAQv1-4-bpw](https://huggingface.co/Mia-AiLab/Ornith-1.5-122B-EXL3-EAQv1-4-bpw) | 131,072 (262,144 native) | not published — measured on your box |
 | Qwen3.8 Flash Next, NVIDIA FP4 (vLLM b12x) | [nvidia/Qwen3.8-Flash-Next-FP4-Local](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-FP4-Local) | 262,144 | not published — measured on your box; shares its weights with the TensorFold recipe |
 | Qwen3.8 27B (SGLang, EAGLE) | [MiaAI-Lab/Qwen3.8-27B-SGLang-DGX-Spark](https://github.com/MiaAI-Lab/Qwen3.8-27B-SGLang-DGX-Spark) | 1,000,000 | 24.2 code · ~18 prose |
@@ -108,6 +109,17 @@ front, which checks the API key. The TensorFold Flash Next and Bolt servers also
 themselves (`TENSORFOLD_API_KEY`); the 27B and Lightning ones have no key of their own.
 The vLLM and TabbyAPI models are containers Spark Swapper creates itself, with
 `--api-key`, bound to `127.0.0.1`.
+
+Inkling 2 Mini isn't supported by a vLLM release yet, so its card runs vLLM's own
+Inkling build (`vllm/vllm-openai:inkling-2-mini`, the arm64 image pinned to commit
+`7cb5dae`) with the vLLM recipe's DGX Spark settings: 262,144 tokens of context, the
+`inkling` reasoning and tool-call parsers, DSpark drafts from the checkpoint's own MTP
+head. It claims half the Spark's memory (`--gpu-memory-utilization 0.5`). Images go in as
+`image_url` parts (up to 8 per request, each side 40–4,096 px). It reasons at *high*
+effort by default; send `chat_template_kwargs: {"reasoning_effort": "low"}` (or `none`,
+`minimal`, `medium`, `xhigh`, `max`) for less. Replies are capped at 32,768 tokens unless
+the request sets `max_tokens`, because the model card warns of long reasoning loops. If
+the DSpark drafts won't start on your box, drop `--speculative-config` in a site override.
 
 Weights live in the shared Hugging Face cache (`~/.cache/huggingface/hub`), so two models
 that use the same checkpoint — the Flash Next recipe and the vLLM FP4 card — take the disk

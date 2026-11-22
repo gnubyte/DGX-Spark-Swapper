@@ -1,5 +1,15 @@
 # Changelog
 
+## 2.2.1
+
+- **Inkling 2 Mini.** Thinking Machines' looped 26B MoE (3.4B active) in about 20 GB,
+  multimodal: it takes images, so OpenClaw uses it as its image model too. It runs on vLLM's
+  own Inkling build (arm64 image and checkpoint both pinned) with the vLLM recipe's DGX Spark
+  settings: 262K context, reasoning and tool calling, DSpark drafts, half the Spark's memory.
+  Installing, switching, the speed check, Storage and Delete all handle it like the other
+  vLLM cards. A catalog entry's `template_kwargs` can now name the template's own way to
+  switch thinking off (Inkling uses `reasoning_effort`, not `enable_thinking`).
+
 ## 2.2.0
 
 - **Pictures & context** (Models tab). Qwen3.8 Flash Next's recipe can serve **256K** — its native window, with a

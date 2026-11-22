@@ -91,7 +91,7 @@ class ConfigTests(unittest.TestCase):
 
     def test_new_spark_recipes_are_in_the_catalog(self):
         models = config.merge(site(), CATALOG, hardware.NVIDIA_GB10)["models"]
-        for key in ("tf27b", "tfflash", "bolt", "nemotron", "laguna", "ornith", "vllmfp4"):
+        for key in ("tf27b", "tfflash", "bolt", "nemotron", "laguna", "inkling", "ornith", "vllmfp4"):
             self.assertIn(key, models)
         bolt, flash, laguna = models["bolt"], models["tfflash"], models["laguna"]
         self.assertEqual(bolt["kind"], "recipe-script")
@@ -106,6 +106,29 @@ class ConfigTests(unittest.TestCase):
         self.assertIn("--api-key", args)
         self.assertEqual(args[args.index("--max-num-seqs") + 1], "4", "DFlash crashes at vLLM's default of 256")
         self.assertIn("--speculative-config", args)
+
+    def test_inkling_takes_images_and_runs_on_its_pinned_vllm_build(self):
+        models = config.merge(site(), CATALOG, hardware.NVIDIA_GB10)["models"]
+        ink = models["inkling"]
+        repo, rev = "thinkingmachines/Inkling-2-Mini", "b85c3cfa615fc413cc9af3379f491b963f3b586a"
+        image = "vllm/vllm-openai:inkling-2-mini-arm64-7cb5dae"
+        self.assertEqual(ink["kind"], "docker")
+        self.assertTrue(ink["vision"], "Inkling takes images, so OpenClaw gets it as its image model too")
+        self.assertEqual(Engine.model_hf_repos(ink), [repo])
+        self.assertIn({"do": "hf_snapshot", "repo": repo, "revision": rev}, ink["install"]["steps"])
+        self.assertIn({"do": "docker_pull", "image": image, "timeout": 7200}, ink["install"]["steps"])
+        args = ink["docker_run"]
+        self.assertIn(image, args)
+        self.assertEqual(args[args.index("--revision") + 1], rev)
+        self.assertEqual(args[args.index("--host") + 1], "127.0.0.1", "the model server stays off the network")
+        self.assertEqual(args[args.index("--served-model-name") + 1], ink["served_id"])
+        self.assertEqual(args[args.index("--max-model-len") + 1], str(ink["context"]))
+        self.assertEqual(args[args.index("--reasoning-parser") + 1], "inkling")
+        self.assertEqual(args[args.index("--tool-call-parser") + 1], "inkling")
+        self.assertIn("image", json.loads(args[args.index("--limit-mm-per-prompt") + 1]))
+        # vLLM claims gpu-memory-utilization × total memory at start, so the free-memory check must cover it.
+        self.assertGreaterEqual(ink["min_free_gib"], float(args[args.index("--gpu-memory-utilization") + 1]) * 121)
+        self.assertIn("/home/pat/.cache/huggingface:/root/.cache/huggingface", args)
 
     def test_hugging_face_models_share_weights_with_the_recipes(self):
         models = config.merge(site(), CATALOG, hardware.NVIDIA_GB10)["models"]
