@@ -19,3 +19,6 @@ state.json
 *.log
 
 # Screenshots are committed on purpose (docs/screenshots/)
+
+# sparkctl build output
+/sparkctl/dist/

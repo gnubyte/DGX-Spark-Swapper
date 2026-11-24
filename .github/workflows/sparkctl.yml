@@ -1,0 +1,107 @@
+name: sparkctl
+
+# Tests sparkctl and builds its .deb packages (arm64 for the DGX Spark, amd64) on every change to it; they're
+# kept as the run's artifacts. Pushing a tag sparkctl-vX.Y.Z (matching sparkctl/VERSION) publishes them as a
+# GitHub release. That release is never marked "latest": installed Swappers look for their own updates at
+# /releases/latest, and must keep finding a Spark Swapper release there.
+
+on:
+  push:
+    branches: ["**"]
+    paths: ["sparkctl/**", ".github/workflows/sparkctl.yml"]
+    tags: ["sparkctl-v*"]
+  pull_request:
+    paths: ["sparkctl/**", ".github/workflows/sparkctl.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sparkctl
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache-dependency-path: sparkctl/go.sum
+      - name: Format
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; echo "run gofmt -w ."; exit 1; }
+      - name: Vet
+        run: go vet ./...
+      - name: Test
+        run: go test -race -count=1 ./...
+
+  deb:
+    needs: test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sparkctl
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache-dependency-path: sparkctl/go.sum
+      - name: Version
+        run: |
+          ver=$(tr -d '[:space:]' < VERSION)
+          [[ "$ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "sparkctl/VERSION must be X.Y.Z, got '$ver'" >&2; exit 1; }
+          if [[ "$GITHUB_REF" == refs/tags/sparkctl-v* && "${GITHUB_REF#refs/tags/sparkctl-v}" != "$ver" ]]; then
+            echo "tag ${GITHUB_REF#refs/tags/} doesn't match sparkctl/VERSION $ver" >&2; exit 1
+          fi
+          echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
+      - name: Build the packages
+        run: bash packaging/build-deb.sh arm64 amd64
+      - name: Install and run on Ubuntu 24.04 and Debian 12
+        run: |
+          for img in ubuntu:24.04 debian:12; do
+            docker run --rm -v "$PWD/dist:/dist:ro" "$img" sh -ec '
+              apt-get install -y -qq /dist/sparkctl_*_amd64.deb >/dev/null
+              sparkctl version
+              sparkctl help >/dev/null
+              test -f /etc/sparkctl/config.json
+              sparkctl doctor || true
+              apt-get purge -y -qq sparkctl >/dev/null
+              test ! -e /usr/bin/sparkctl'
+          done
+      - name: End to end (the installed TUI, a demo Swapper, a Compose stack, the real Docker)
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq python3-pyte >/dev/null
+          sudo bash test/e2e/run.sh dist/sparkctl_*_amd64.deb "$GITHUB_WORKSPACE"
+      - name: Lintian
+        run: |
+          docker run --rm -v "$PWD/dist:/dist:ro" debian:12 sh -ec '
+            apt-get update -qq >/dev/null && apt-get install -y -qq lintian >/dev/null
+            for d in /dist/*.deb; do lintian --fail-on error,warning "$d"; done'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sparkctl-debs
+          path: |
+            sparkctl/dist/*.deb
+            sparkctl/dist/SHA256SUMS
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/sparkctl-v')
+    needs: deb
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: sparkctl-debs
+          path: dist
+      - name: Publish (never as the latest release)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag=${GITHUB_REF#refs/tags/}
+          gh release create "$tag" dist/*.deb dist/SHA256SUMS --repo "$GITHUB_REPOSITORY" --latest=false \
+            --title "sparkctl ${tag#sparkctl-v}" \
+            --notes "sparkctl, the terminal manager for Spark Swapper, Sparkia and Docker. Install: sudo apt install ./sparkctl_${tag#sparkctl-v}_arm64.deb (DGX Spark) or the amd64 one."

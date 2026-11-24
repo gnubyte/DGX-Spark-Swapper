@@ -1,0 +1,87 @@
+.TH SPARKCTL 1 "November 2026" "sparkctl" "User Commands"
+.SH NAME
+sparkctl \- manage Spark Swapper, Sparkia, Docker and the services on a DGX Spark
+.SH SYNOPSIS
+.B sparkctl
+.br
+.B sparkctl
+.I command
+.RI [ args ]
+.SH DESCRIPTION
+With no arguments,
+.B sparkctl
+opens a full-screen terminal interface with six screens:
+.TP
+.B 1 Overview
+memory, disks, load, the GPU, what Spark Swapper serves, the Sparkia stack, Docker and any failed service.
+.TP
+.B 2 Swapper
+the models: swap, install (including a model's other builds), change a model's context window and options,
+follow a job's log, cancel it, run the speed check, turn pictures on or off, delete a model's files, update the Swapper.
+.TP
+.B 3 Sparkia
+the Docker Compose stack in /opt/sparkia: each service's log, restart, stop, start, recreate, up, pull, down;
+pin the release (SPARKIA_TAG), run the updater and follow it, the firewall's status and live traffic, a shell in a container.
+.TP
+.B 4 Docker
+containers (with CPU and memory), images, volumes and disk usage: logs, start, stop, restart, kill, remove, a shell,
+inspect, pull, prune.
+.TP
+.B 5 Services
+the systemd units the Swapper and Sparkia run on: start, stop, restart, enable or disable at boot, clear a failure,
+status and the journal.
+.TP
+.B 6 Run
+saved command lines and any command you type, run in the terminal; and the history of what sparkctl did, with its output.
+.PP
+Every action that changes something says the command it runs and asks first when it can't be undone. Root actions go
+through sudo: when sudo needs a password, sparkctl hands the terminal to sudo once (press
+.B S
+to do it ahead). Logs follow live and can be searched, filtered and saved. Press
+.B ?
+for the keys.
+.SH COMMANDS
+.TP
+.BR status " [" \-\-json ]
+What's serving, Sparkia, Docker and the services, in one look.
+.TP
+.B models
+The Swapper's models and their state.
+.TP
+.BI swap " MODEL"
+Swap Spark Swapper to MODEL (its key, its title or a unique part of either) and follow the swap.
+.TP
+.BR login " [" \fIUSER\fR ]
+Sign in to Spark Swapper. The session and the fingerprint of the Swapper's certificate are kept in
+~/.config/sparkctl/state.json, readable only by you.
+.TP
+.B logout
+Sign out.
+.TP
+.BI logs " TARGET"
+Follow a log: \fBswapper\fR, \fBupdater\fR, \fBsparkia\fR[\fB:\fISERVICE\fR], \fBdocker:\fICONTAINER\fR, \fBunit:\fINAME\fR.
+.TP
+.B doctor
+Check everything sparkctl relies on and say what's wrong (exit status 1 when something is).
+.TP
+.B version
+.SH FILES
+.TP
+.I /etc/sparkctl/config.json
+The machine's settings: the Swapper's address, the Sparkia folder, the services shown, saved commands.
+.TP
+.I ~/.config/sparkctl/config.json
+Your own settings, over the machine's.
+.TP
+.I ~/.config/sparkctl/state.json
+Your Swapper sign-in and the certificate you trusted.
+.TP
+.I ~/sparkctl-logs/
+Logs saved from a log view.
+.SH SECURITY
+Spark Swapper's certificate is self-signed: sparkctl trusts the one it sees first and refuses a different one until you
+press \fBT\fR on the Swapper screen. Passwords are never stored; sudo asks for its own.
+.SH SEE ALSO
+.BR docker (1),
+.BR systemctl (1),
+.BR journalctl (1)
