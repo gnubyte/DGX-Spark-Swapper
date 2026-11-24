@@ -286,6 +286,13 @@ made now, as JSON), its units, and the ComfyUI node that loads a GGUF text encod
 
 ---
 
+## sparkctl: the terminal manager
+
+[`sparkctl/`](sparkctl/README.md) is a full-screen terminal app (and a few script commands) for the whole Spark:
+swap, install and configure the Swapper's models, manage the Sparkia Compose stack, its releases and firewall,
+Docker containers, images and volumes, the systemd services, and follow any log. It ships as a `.deb` for
+Ubuntu and Debian (`sudo apt install ./sparkctl_1.0.0_arm64.deb`, then `sparkctl`).
+
 ## Install (one click)
 
 On the Spark or Strix Halo box (Ubuntu / DGX OS, Python 3.10+):
