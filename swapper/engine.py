@@ -46,6 +46,10 @@ FRONT_CONF = Path("/etc/nginx/conf.d/spark-model-front.conf")
 FRONT_MARK = "# Written by Spark Swapper"
 _SECRETISH = re.compile(r"KEY|TOKEN|SECRET|PASSWORD", re.I)
 DOCKER_KINDS = ("docker", "sglang-docker")
+# No engine phones home: vLLM's usage stats (stats.vllm.ai), Hugging Face's library telemetry, TensorFold's
+# release check and anything that honours DO_NOT_TRACK. Every start gets these; a card's env can't turn them back on.
+PRIVACY_ENV = {"VLLM_NO_USAGE_STATS": "1", "DO_NOT_TRACK": "1", "HF_HUB_DISABLE_TELEMETRY": "1",
+               "TENSORFOLD_NO_UPDATE_CHECK": "1"}
 
 
 def key_digest(key: str) -> str:
@@ -477,6 +481,49 @@ class Engine:
         return (f"{s.get('label', s['name'])} needs a newer {m['title']} recipe than the one on this box. "
                 "Press Update recipe… in the card's Details first.")
 
+    @staticmethod
+    def _checkpoint_fetched(hub: Path, s: dict) -> bool:
+        """A switch's own checkpoint (its "fetch") is in the cache: a snapshot with its marker file (or config.json)."""
+        f = s.get("fetch") or {}
+        snaps = hub / f.get("checkpoint", "") / "snapshots"
+        marker = f.get("marker") or "config.json"
+        return bool(f.get("checkpoint")) and snaps.is_dir() and any((p / marker).is_file() for p in snaps.iterdir())
+
+    def _fetch_switch_checkpoints(self, m: dict, home: str, env: dict, job: Job):
+        """A switch that is on and serves weights of its own (the vLLM recipe's ABLIT=1: a ~99 GiB gated checkpoint)
+        downloads them before the start, with the recipe's own download script, once."""
+        on = m.get("switches_on") or {}
+        hub = Path(home) / ".cache/huggingface/hub"
+        for s in self.switches_of(m):
+            f = s.get("fetch")
+            if not f or not on.get(s["name"]) or DEMO or self._checkpoint_fetched(hub, s):
+                continue
+            if s.get("needs_hf_token") and not env.get("HF_TOKEN"):
+                raise SwapFailed(self.switch_blocker(m, s) or f"{s.get('label', s['name'])} needs a Hugging Face token.")
+            job.say(f"{s.get('label', s['name'])}: downloading its checkpoint first ({f.get('size', 'large')}, "
+                    "once) — this can take an hour")
+            logfile = self.state_dir / f"fetch-{s['name']}-{job.id}.log"
+            with open(logfile, "w") as fh:
+                proc = subprocess.Popen(list(f["cmd"]), cwd=m["dir"], env=env, stdout=fh, stderr=subprocess.STDOUT,
+                                        stdin=subprocess.DEVNULL, start_new_session=True)
+                deadline = time.time() + float(f.get("timeout", 21600))
+                while proc.poll() is None:
+                    if job.cancel_by or time.time() > deadline:
+                        try:
+                            os.killpg(proc.pid, 15)
+                        except OSError:
+                            pass
+                        proc.wait(timeout=30)
+                        self.check_cancel(job)
+                        raise SwapFailed(f"{s.get('label', s['name'])}: the download timed out.")
+                    time.sleep(5)
+            if proc.returncode != 0 or not self._checkpoint_fetched(hub, s):
+                tail = logfile.read_text(errors="replace")[-600:]
+                gate = (f" Accept its terms at https://huggingface.co/{s['gated_repo']} (signed in to the account "
+                        "whose token is saved)." if s.get("gated_repo") else "")
+                raise SwapFailed(f"{s.get('label', s['name'])}: the download failed (exit {proc.returncode}).{gate}\n{tail}")
+            job.say(f"{s.get('label', s['name'])}: checkpoint downloaded.")
+
     def switch_blocker(self, m: dict, s: dict) -> str | None:
         """Why switch `s` of card `m` can't be turned on yet, or None."""
         unsupported = self._switch_unsupported(m, s)
@@ -674,8 +721,13 @@ class Engine:
         return sh(["docker", "inspect", name], timeout=15)[0] == 0
 
     @staticmethod
-    def args_hash(m: dict) -> str:
-        return hashlib.sha256(json.dumps(m.get("docker_run") or []).encode()).hexdigest()[:16]
+    def docker_args(m: dict) -> list[str]:
+        """The docker run arguments for a docker card: its own, with the engines' phone-home switched off first."""
+        return [a for k, v in PRIVACY_ENV.items() for a in ("-e", f"{k}={v}")] + list(m.get("docker_run") or [])
+
+    @classmethod
+    def args_hash(cls, m: dict) -> str:
+        return hashlib.sha256(json.dumps(cls.docker_args(m)).encode()).hexdigest()[:16]
 
     def container_current(self, m: dict) -> bool:
         """Whether the existing container was created with the docker_run we'd
@@ -1319,7 +1371,7 @@ class Engine:
                     raise SwapFailed(f"docker start failed: {out}")
             else:
                 rc, out = sh(["docker", "run", "-d", "--name", m["container"],
-                              "--label", f"swapper.args={self.args_hash(m)}", *m["docker_run"]], timeout=300)
+                              "--label", f"swapper.args={self.args_hash(m)}", *self.docker_args(m)], timeout=300)
                 job.say(out)
                 if rc != 0:
                     raise SwapFailed(f"docker run failed: {out[-400:]}")
@@ -1330,6 +1382,13 @@ class Engine:
                    "PORT": str(self.api_port), "BIND": "127.0.0.1",
                    "API_KEY": self.key, "READY_TIMEOUT_S": str(timeout)}
             env.update({k: str(v) for k, v in (m.get("env") or {}).items()})
+            env.update(PRIVACY_ENV)
+            # the recipe's docker run passes only the variables it names; EXTRA_DOCKER_ARGS is its way in
+            env["EXTRA_DOCKER_ARGS"] = " ".join([env.get("EXTRA_DOCKER_ARGS", "").strip()]
+                                                + [f"-e {k}={v}" for k, v in PRIVACY_ENV.items()]).strip()
+            if self.needs_hf_token(m) and self.hf_token():
+                env["HF_TOKEN"] = self.hf_token()
+            self._fetch_switch_checkpoints(m, home, env, job)
             logfile = self.state_dir / f"flash-start-{job.id}.log"
             job.say(f"./start.sh  (PORT={env['PORT']} BIND=127.0.0.1, "
                     + " ".join(f"{k}={v}" for k, v in (m.get('env') or {}).items())
@@ -1340,7 +1399,7 @@ class Engine:
                                         stdin=subprocess.DEVNULL, start_new_session=True)
             self._wait_healthy(key, job, timeout + 120, proc=proc, logfile=logfile)
         elif kind == "recipe-script":
-            env = {"PORT": self.api_port, **(m.get("env") or {})}
+            env = {"PORT": self.api_port, **(m.get("env") or {}), **PRIVACY_ENV}
             if self.needs_hf_token(m) and self.hf_token():
                 # a switch that is on downloads a gated file on its first start (the abliteration overlay); the
                 # token goes to the recipe's own Hugging Face download, and the log line hides it

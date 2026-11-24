@@ -83,11 +83,13 @@
         { "tokens": 524288, "label": "512K", "pictures": false, "min_free_gib": 100, "streams": 3, "variant": "long",
           "detail": "longer chats: YaRN ×4 on the long-context build (INT4 checkpoint, three full windows at once)",
           "env": { "CONTEXT": "524288", "PARALLEL": "3", "TF_FLASHNEXT_YARN": "4",
+                   "MODEL_REVISION": "8b145d7f6505f71521a73646c268e51f6af532e4",
                    "CONTAINER_NAME": "qwen38-flash-next-tf-long", "STATE_DIR": "{{HOME}}/.local/state/qwen38-flash-next-tf-long",
                    "TENSORFOLD_MEMORY_RESERVE_GIB": "10", "MEM_FLOOR_GIB": "10" } },
         { "tokens": 1048576, "label": "1M", "pictures": false, "min_free_gib": 108, "streams": 2, "variant": "long",
           "detail": "the longest chats: YaRN ×4 on the long-context build (INT4 checkpoint, one full 1M window, shorter chats share the rest)",
           "env": { "CONTEXT": "1048576", "PARALLEL": "2", "TF_FLASHNEXT_YARN": "4",
+                   "MODEL_REVISION": "8b145d7f6505f71521a73646c268e51f6af532e4",
                    "CONTAINER_NAME": "qwen38-flash-next-tf-long", "STATE_DIR": "{{HOME}}/.local/state/qwen38-flash-next-tf-long",
                    "TENSORFOLD_MEMORY_RESERVE_GIB": "10", "MEM_FLOOR_GIB": "10" } }
       ],
@@ -116,7 +118,8 @@
                   "dir": "{{HOME}}/Qwen3.8-Flash-Next-TensorFold-LongContext", "branch": "zig-int4-ar",
                   "ref": "5b2422fbe0c456e2b6c3acd077fbee13c949eefd" },
                 { "do": "run", "cmd": ["bash", "scripts/prepare.sh"], "cwd": "{{HOME}}/Qwen3.8-Flash-Next-TensorFold-LongContext",
-                  "as": "user", "timeout": 21600, "model_env": true }
+                  "as": "user", "timeout": 21600, "model_env": true,
+                  "env": { "MODEL_REVISION": "8b145d7f6505f71521a73646c268e51f6af532e4" } }
               ],
               "ready": [
                 { "file": "{{HOME}}/Qwen3.8-Flash-Next-TensorFold-LongContext/start.sh" },
@@ -160,7 +163,7 @@
       },
       "repo": "https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold",
       "notes": [
-        "256K and 128K run the v1.2.7 build, which has no YaRN. 512K and 1M run the long-context build: the recipe's earlier TensorFold engine with the INT4-AutoRound checkpoint (about 10% lower general scores on its authors' harness), YaRN ×4, images and video, no abliterated or PDF. It is a separate ~160 GB install: Options… offers it. Apps keep the same model ID whichever window serves.",
+        "256K and 128K run the v1.2.7 build, which has no YaRN. 512K and 1M run the long-context build: the recipe's earlier TensorFold engine with the INT4-AutoRound checkpoint (about 10% lower general scores on its authors' harness), YaRN ×4, images and video, no abliterated or PDF. It is a separate ~160 GB install: Options… offers it. Apps keep the same model ID whichever window serves. Abliterated at 512K: use the Qwen3.8 Flash Next (vLLM) card with Abliterated on.",
         "Images go in as image_url parts with data: URLs (JPEG or WebP, up to 50 a request); public https:// links are refused.",
         "Installed before November 2026? Press Update recipe… below: it pulls the v1.2.7 recipe and builds its engine image (about an hour; the weights aren't downloaded again). Abliterated, video and PDF need it."
       ],
@@ -649,6 +652,15 @@
           "detail": "the longest chats (YaRN) — no room for pictures",
           "env": { "YARN": "1", "YARN_MAX_MODEL_LEN": "524288", "HOST_RESERVE_GIB": "26" } }
       ],
+      "switches": [
+        { "name": "ablit", "label": "Abliterated", "default": false, "admin_only": true, "needs_hf_token": true,
+          "gated_repo": "drowzeys/keys-Qwen3.8-flash-next-ablit-Mia-Single-Spark-only", "name_suffix": " · abliterated",
+          "detail": "drowzeys's Keys abliterated checkpoint (the same Mia NVFP4 weights with the refusal direction projected out), served by this recipe's ABLIT=1 — at 256K or 512K. A separate ~99 GiB gated download, on the first start only.",
+          "warn": "This model has had its safety refusals removed. The checkpoint is gated: accept its terms on Hugging Face (signed in) and save a token on the Settings tab first. The first start downloads ~99 GiB before it loads.",
+          "fetch": { "cmd": ["bash", "./download.sh"], "checkpoint": "models--drowzeys--keys-Qwen3.8-flash-next-ablit-Mia-Single-Spark-only",
+                     "marker": "ABLIT_META.json", "size": "~99 GiB", "timeout": 21600 },
+          "on": { "ABLIT": "1" }, "off": { "ABLIT": "0" } }
+      ],
       "vision": true,
       "min_free_gib": 100,
       "start_timeout_s": 2100,
@@ -661,7 +673,10 @@
         "source": "sparkDash sweep in the recipe's README (prose)", "estimate": false
       },
       "repo": "https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark",
-      "footprint": { "hf": ["Mia-AiLab/Qwen3.8-Flash-Next-NVFP4"] },
+      "notes": [
+        "The one way to serve Flash Next abliterated at 512K: the TensorFold card's 512K/1M build runs a different (INT4) checkpoint the abliteration overlay can't graft onto, and its 256K build has no YaRN. Turn on Abliterated in this card's Options…."
+      ],
+      "footprint": { "hf": ["Mia-AiLab/Qwen3.8-Flash-Next-NVFP4", "drowzeys/keys-Qwen3.8-flash-next-ablit-Mia-Single-Spark-only"] },
       "install": {
         "requires": ["git", "docker"],
         "size_gb": 130,

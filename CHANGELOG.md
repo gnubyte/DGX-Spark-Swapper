@@ -1,5 +1,22 @@
 # Changelog
 
+## 2.3.1
+
+- **Flash Next 512K / 1M installs again.** The INT4-AutoRound checkpoint's author squashed its Hugging Face history
+  on 2026-11-01, so the commit the long-context recipe pins (`14642741`) is gone and `prepare.sh` stopped with
+  "Revision not found". The install and both long windows now pass `MODEL_REVISION` = `8b145d7f`, the one commit
+  left (same 125 files, 121.9 GiB, `qwen4_exp` GPTQ int4 g128).
+- **Abliterated at 512K, on the vLLM Flash Next card.** TensorFold can't do it (its v1.2.7 build stops at 256K, and
+  the long-context build's INT4 checkpoint can't take the abliteration overlay), but the vLLM recipe serves drowzeys's
+  abliterated checkpoint with YaRN at 512K. *Options…* ▸ **Abliterated** on that card (admin only, Hugging Face token
+  required): the first start downloads the gated ~99 GiB checkpoint with the recipe's `download.sh`, once. A switch can
+  now name a checkpoint of its own to fetch before the start (`fetch`).
+- **No engine phones home.** Every model start sets `VLLM_NO_USAGE_STATS=1`, `DO_NOT_TRACK=1`,
+  `HF_HUB_DISABLE_TELEMETRY=1` and `TENSORFOLD_NO_UPDATE_CHECK=1`: in docker cards' containers (recreated once), in
+  recipe scripts' environment, and into the vLLM Flash recipe's container through its `EXTRA_DOCKER_ARGS`. vLLM's
+  anonymous usage reports (stats.vllm.ai) were on for the vLLM Flash Next, Laguna, Inkling and FP4 cards. None of
+  the MiaAI-Lab recipes or the TensorFold builds they pin contacts a MiaAI host.
+
 ## 2.3.0
 
 - **Qwen3.8 Flash Next on TensorFold v1.2.7.** The card follows its recipe's new build: 58.5 tok/s alone and 230.1
