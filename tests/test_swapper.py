@@ -145,6 +145,42 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(args[args.index("--max-num-seqs") + 1], "4", "DFlash crashes at vLLM's default of 256")
         self.assertIn("--speculative-config", args)
 
+    def test_flash_next_long_context_build_pins_a_revision_hugging_face_still_has(self):
+        # azampatti squashed the INT4-AutoRound repo's history on 2026-11-01: the recipe's own pin (14642741) is gone,
+        # so the install and both long windows pass the one commit left, or prepare.sh fails "Revision not found".
+        tf = CATALOG["models"]["tfflash"]
+        rev = "8b145d7f6505f71521a73646c268e51f6af532e4"
+        step = tf["variants"]["long"]["fields"]["install"]["steps"][1]
+        self.assertTrue(step["model_env"])
+        self.assertEqual(step["env"]["MODEL_REVISION"], rev)
+        long_windows = [c for c in tf["contexts"] if c.get("variant") == "long"]
+        self.assertEqual({c["label"] for c in long_windows}, {"512K", "1M"})
+        for c in long_windows:
+            self.assertEqual(c["env"]["MODEL_REVISION"], rev, f"{c['label']} must start what prepare.sh fetched")
+
+    def test_vllm_flash_next_serves_abliterated_at_512k(self):
+        flash = CATALOG["models"]["flash"]
+        self.assertIn(524288, [c["tokens"] for c in flash["contexts"]])
+        ablit = next(s for s in flash["switches"] if s["name"] == "ablit")
+        self.assertTrue(ablit["admin_only"] and ablit["needs_hf_token"])
+        self.assertEqual(ablit["on"], {"ABLIT": "1"})
+        self.assertEqual(ablit["fetch"]["cmd"], ["bash", "./download.sh"])
+        self.assertEqual(ablit["fetch"]["marker"], "ABLIT_META.json")
+        self.assertIn(ablit["gated_repo"], Engine.model_hf_repos(flash))
+
+    def test_no_engine_phones_home(self):
+        from engine import PRIVACY_ENV
+        self.assertEqual(PRIVACY_ENV["VLLM_NO_USAGE_STATS"], "1")
+        self.assertEqual(PRIVACY_ENV["HF_HUB_DISABLE_TELEMETRY"], "1")
+        self.assertEqual(PRIVACY_ENV["TENSORFOLD_NO_UPDATE_CHECK"], "1")
+        m = {"docker_run": ["--network", "host", "img", "--port", "1"]}
+        args = Engine.docker_args(m)
+        self.assertEqual(args[-5:], m["docker_run"], "the card's own arguments come last, the image among them")
+        self.assertIn("VLLM_NO_USAGE_STATS=1", args[:args.index("--network")])
+        self.assertNotEqual(Engine.args_hash(m), hashlib.sha256(json.dumps(m["docker_run"]).encode()).hexdigest()[:16],
+                            "containers made before are recreated once, with the switches")
+        self.assertNotIn("mia-labs", json.dumps(CATALOG).lower())
+
     def test_inkling_takes_images_and_runs_on_its_pinned_vllm_build(self):
         models = config.merge(site(), CATALOG, hardware.NVIDIA_GB10)["models"]
         ink = models["inkling"]
